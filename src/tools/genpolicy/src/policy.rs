@@ -380,6 +380,9 @@ pub struct CommonData {
 
     /// Storage classes which mounts should be handled as smb mounts
     pub smb_storage_classes: Vec<String>,
+
+    /// Do not check sandbox name (e.g., if they are generated).
+    pub ignore_sandbox_name: bool,
 }
 
 /// Struct used to read data from the settings file and copy that data into the policy.
@@ -540,6 +543,7 @@ impl AgentPolicy {
             &namespace,
             c_settings,
             use_host_network,
+            self.settings.common.ignore_sandbox_name,
         );
 
         let is_privileged = yaml_container.is_privileged();
@@ -903,6 +907,7 @@ fn get_container_annotations(
     namespace: &str,
     c_settings: &KataSpec,
     use_host_network: bool,
+    ignore_sandbox_name: bool,
 ) -> BTreeMap<String, String> {
     let mut annotations = if let Some(a) = resource.get_annotations() {
         let mut a_cloned = a.clone();
@@ -914,7 +919,11 @@ fn get_container_annotations(
 
     c_settings.add_annotations(&mut annotations);
 
-    if let Some(name) = resource.get_sandbox_name() {
+    if ignore_sandbox_name {
+        annotations
+            .entry("io.kubernetes.cri.sandbox-name".to_string())
+            .or_insert("$(generated-name)".to_string());
+    } else if let Some(name) = resource.get_sandbox_name() {
         annotations
             .entry("io.kubernetes.cri.sandbox-name".to_string())
             .or_insert(name);

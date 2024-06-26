@@ -284,7 +284,8 @@
         "smb_storage_classes": [
             "cc-azurefile-csi",
             "cc-azurefile-premium-csi"
-        ]
+        ],
+        "ignore_sandbox_name": false
     },
     "kata_config": {
         "confidential_guest": true
