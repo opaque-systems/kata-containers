@@ -37,6 +37,7 @@ pub struct Container {
     pub config_layer: DockerConfigLayer,
     pub passwd: String,
     pub group: String,
+    pub manifest_digest: String,
 }
 
 /// Image config layer properties.
@@ -204,6 +205,7 @@ impl Container {
             config_layer,
             passwd,
             group,
+            manifest_digest: digest_hash,
         })
     }
 
