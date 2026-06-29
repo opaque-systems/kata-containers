@@ -15,6 +15,7 @@ use crate::settings;
 use crate::utils::Config;
 use crate::volume;
 use crate::yaml;
+use crate::deployment::IntOrString;
 
 use async_trait::async_trait;
 use log::{debug, warn};
@@ -246,7 +247,7 @@ struct Probe {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TCPSocketAction {
-    port: String,
+    port: IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -255,7 +256,7 @@ struct TCPSocketAction {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HTTPGetAction {
-    port: String,
+    port: IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
