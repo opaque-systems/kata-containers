@@ -1109,7 +1109,7 @@ allow_var(p_process, i_process, i_var, s_name, s_namespace) if {
     p_name_value[0] == name_value[0]
 
     # TODO: should these be handled in a different way?
-    always_allowed := ["$(host-name)", "$(node-name)", "$(pod-uid)"]
+    always_allowed := ["$(host-name)", "$(node-name)", "$(pod-uid)", "$(any-value)"]
     some allowed in always_allowed
     contains(p_name_value[1], allowed)
 
