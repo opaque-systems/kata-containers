@@ -68,14 +68,22 @@ struct DeploymentStrategy {
     rollingUpdate: Option<RollingUpdateDeployment>,
 }
 
+/// Kubernetes IntOrString: accepts either an integer or a percentage string (e.g. "25%").
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntOrString {
+    Int(i32),
+    String(String),
+}
+
 /// Reference / Kubernetes API / Workload Resources / Deployment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RollingUpdateDeployment {
     #[serde(skip_serializing_if = "Option::is_none")]
-    maxSurge: Option<i32>,
+    maxSurge: Option<IntOrString>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    maxUnavailable: Option<i32>,
+    maxUnavailable: Option<IntOrString>,
 }
 
 #[async_trait]

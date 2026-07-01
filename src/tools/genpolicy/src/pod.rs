@@ -15,6 +15,7 @@ use crate::settings;
 use crate::utils::Config;
 use crate::volume;
 use crate::yaml;
+use crate::deployment::IntOrString;
 
 use async_trait::async_trait;
 use log::{debug, warn};
@@ -246,7 +247,7 @@ struct Probe {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TCPSocketAction {
-    port: String,
+    port: IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -255,7 +256,7 @@ struct TCPSocketAction {
 /// See Reference / Kubernetes API / Workload Resources / Pod.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HTTPGetAction {
-    port: String,
+    port: IntOrString,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     host: Option<String>,
@@ -763,10 +764,9 @@ impl EnvFromSource {
             if let Some(value) = secret::get_values(&secret_env_source.name, secrets) {
                 return value.clone();
             } else {
-                panic!(
-                    "Couldn't get values from secret ref: {}",
-                    &secret_env_source.name
-                );
+                // TODO: if the values can not be read/found, return some error makeing it explicit;
+                // if the values can be found, we should not include the secret values in the policy.
+                return vec![ ]
             }
         }
         panic!("envFrom: no configmap or secret source found!");
@@ -833,7 +833,9 @@ impl EnvVar {
             panic!("Environment variable without value or valueFrom!");
         }
 
-        panic!("Couldn't get the value of env var: {}", &self.name);
+        // TODO: even if the secretKeyRef can be found, we should replace the 
+        // real value with $(any-value) too.
+        return "$(any-value)".to_string()
     }
 
     fn get_annotation_value(
