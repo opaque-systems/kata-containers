@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	v1 "github.com/containerd/cgroups/stats/v1"
 	v2 "github.com/containerd/cgroups/v2/stats"
@@ -49,6 +50,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 )
@@ -183,7 +185,7 @@ type SandboxConfig struct {
 	DisableGuestSeccomp bool
 
 	// EmptyDirMode specifies how Kubernetes emptyDir volumes are handled.
-	// Valid values are "shared-fs" (default) or "block-encrypted".
+	// Valid values are "shared-fs" (default), "block-encrypted", or "block-plain".
 	EmptyDirMode string
 
 	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
@@ -263,11 +265,6 @@ type Sandbox struct {
 	seccompSupported  bool
 	disableVMShutdown bool
 	isVCPUsPinningOn  bool
-
-	// hotplugNetworkConfigApplied prevents network config API being called
-	// multiple times for hot-plugged network device when Sandbox has multiple
-	// containers.
-	hotplugNetworkConfigApplied bool
 }
 
 // ID returns the sandbox identifier string.
@@ -328,6 +325,81 @@ func (s *Sandbox) GetHypervisorPid() (int, error) {
 	}
 
 	return pids[0], nil
+}
+
+// RescanNetwork re-scans the network namespace for endpoints if none have
+// been discovered yet. This is idempotent: if endpoints already exist it
+// returns immediately. It enables Docker 26+ support where networking is
+// configured after task creation but before Start.
+//
+// Docker 26+ configures networking (veth pair, IP addresses) between
+// Create and Start. The interfaces may not be present immediately, so
+// this method polls until they appear or a timeout is reached.
+//
+// When new endpoints are found, the guest agent is informed about the
+// interfaces and routes so that networking becomes functional inside the VM.
+func (s *Sandbox) RescanNetwork(ctx context.Context) error {
+	if s.config.NetworkConfig.DisableNewNetwork {
+		return nil
+	}
+	if len(s.network.Endpoints()) > 0 {
+		return nil
+	}
+
+	const maxWait = 5 * time.Second
+	const pollInterval = 50 * time.Millisecond
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	s.Logger().Debug("waiting for network interfaces in namespace")
+
+	for {
+		if _, err := s.network.AddEndpoints(ctx, s, nil, true); err != nil {
+			return err
+		}
+		if len(s.network.Endpoints()) > 0 {
+			return s.configureGuestNetwork(ctx)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			s.Logger().Warn("no network interfaces found after timeout — networking may be configured by prestart hooks")
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// configureGuestNetwork informs the guest agent about discovered network
+// endpoints so that interfaces and routes become functional inside the VM.
+func (s *Sandbox) configureGuestNetwork(ctx context.Context) error {
+	endpoints := s.network.Endpoints()
+	s.Logger().WithField("endpoints", len(endpoints)).Info("configuring hotplugged network in guest")
+
+	// Note: ARP neighbors (3rd return value) are not propagated here
+	// because the agent interface only exposes per-entry updates. The
+	// full setupNetworks path in kataAgent handles them; this path is
+	// only reached for late-discovered endpoints where neighbor entries
+	// are populated dynamically by the kernel.
+	interfaces, routes, _, err := generateVCNetworkStructures(ctx, endpoints)
+	if err != nil {
+		return fmt.Errorf("generating network structures: %w", err)
+	}
+	for _, ifc := range interfaces {
+		if _, err := s.agent.updateInterface(ctx, ifc); err != nil {
+			return fmt.Errorf("updating interface %s in guest: %w", ifc.Name, err)
+		}
+	}
+	if len(routes) > 0 {
+		if _, err := s.agent.updateRoutes(ctx, routes); err != nil {
+			return fmt.Errorf("updating routes in guest: %w", err)
+		}
+	}
+	return nil
 }
 
 // GetAllContainers returns all containers.
@@ -808,21 +880,38 @@ func (s *Sandbox) createResourceController() error {
 			resources.Devices = spec.Linux.Resources.Devices
 
 			intptr := func(i int64) *int64 { return &i }
-			// Determine if device /dev/null and /dev/urandom exist, and add if they don't
+			// Compare existing entries by value (nil-safe). Comparing the
+			// *int64 fields directly against intptr(...) only compares
+			// addresses, which never matches because intptr() returns a fresh
+			// pointer on every call.
 			nullDeviceExist := false
 			urandomDeviceExist := false
 			ptmxDeviceExist := false
-			for _, device := range resources.Devices {
-				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(3) {
-					nullDeviceExist = true
+			loopControlDeviceExist := false
+			loopBlockDeviceExist := false
+			for _, d := range resources.Devices {
+				if d.Major == nil {
+					continue
 				}
-
-				if device.Type == "c" && device.Major == intptr(1) && device.Minor == intptr(9) {
-					urandomDeviceExist = true
-				}
-
-				if device.Type == "c" && device.Major == intptr(5) && device.Minor == intptr(2) {
-					ptmxDeviceExist = true
+				switch d.Type {
+				case "c":
+					if d.Minor == nil {
+						continue
+					}
+					switch {
+					case *d.Major == 1 && *d.Minor == 3:
+						nullDeviceExist = true
+					case *d.Major == 1 && *d.Minor == 9:
+						urandomDeviceExist = true
+					case *d.Major == 5 && *d.Minor == 2:
+						ptmxDeviceExist = true
+					case *d.Major == 10 && *d.Minor == 237:
+						loopControlDeviceExist = true
+					}
+				case "b":
+					if *d.Major == 7 && d.Minor == nil {
+						loopBlockDeviceExist = true
+					}
 				}
 			}
 
@@ -849,6 +938,27 @@ func (s *Sandbox) createResourceController() error {
 					{Type: "c", Major: intptr(5), Minor: intptr(2), Access: rwm, Allow: true},
 				}...)
 
+			}
+
+			// When sandbox_cgroup_only is enabled the shim threads inherit
+			// the sandbox device cgroup, so any rootfs whose mount source is
+			// a regular file backed by a loop device (e.g. the blockfile
+			// snapshotter) needs /dev/loop-control and the /dev/loopN block
+			// nodes allowlisted, otherwise containerd's loop setup fails
+			// with EPERM on open("/dev/loop-control").
+			if s.config.SandboxCgroupOnly {
+				if !loopControlDeviceExist {
+					// "/dev/loop-control"
+					resources.Devices = append(resources.Devices, specs.LinuxDeviceCgroup{
+						Type: "c", Major: intptr(10), Minor: intptr(237), Access: rwm, Allow: true,
+					})
+				}
+				if !loopBlockDeviceExist {
+					// "/dev/loop*" (block major 7, any minor)
+					resources.Devices = append(resources.Devices, specs.LinuxDeviceCgroup{
+						Type: "b", Major: intptr(7), Access: rwm, Allow: true,
+					})
+				}
 			}
 
 			if spec.Linux.Resources.CPU != nil {
@@ -1015,7 +1125,7 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 
 // cleanupEphemeralDisks removes ephemeral disk images and their mount info.
 func (s *Sandbox) cleanupEphemeralDisks() error {
-	if s.config.EmptyDirMode != EmptyDirModeVirtioBlkEncrypted {
+	if !isBlockEmptyDirMode(s.config.EmptyDirMode) {
 		return nil
 	}
 
@@ -1029,6 +1139,10 @@ func (s *Sandbox) cleanupEphemeralDisks() error {
 	}
 
 	return nil
+}
+
+func isBlockEmptyDirMode(mode string) bool {
+	return mode == EmptyDirModeVirtioBlkEncrypted || mode == EmptyDirModeVirtioBlkPlain
 }
 
 func (s *Sandbox) createNetwork(ctx context.Context) error {
@@ -2266,6 +2380,65 @@ func (s *Sandbox) GetVfioDeviceGuestPciPath(hostBDF string) types.PciPath {
 	return types.PciPath{}
 }
 
+// hotplugVfioNetworkDevice hotplugs the VFIO device backing a DAN network
+// endpoint into the VM and records its guest PCI path on the endpoint.
+//
+// The device is attached at sandbox scope so that it is available before any
+// container is created -- in particular before init containers, which do not
+// reference the device in their spec. When a workload container later
+// references the same VFIO group through a device plugin, the device manager
+// finds the existing device by major:minor and only bumps its reference
+// counts, so the device is neither plugged twice nor unplugged when that
+// container exits.
+func (s *Sandbox) hotplugVfioNetworkDevice(ctx context.Context, ep *VfioEndpoint) error {
+	if !ep.PciPath().IsNil() {
+		// The device is already attached and configured.
+		return nil
+	}
+
+	if s.config.HypervisorConfig.HotPlugVFIO == config.NoPort {
+		return fmt.Errorf("cannot attach VFIO network interface %q (BDF %s): hot_plug_vfio port is not configured", ep.Name(), ep.HostBDF)
+	}
+
+	devPath, err := drivers.GetVFIODevPath(ep.HostBDF)
+	if err != nil {
+		return fmt.Errorf("failed to resolve VFIO device path for network interface %q (BDF %s): %v", ep.Name(), ep.HostBDF, err)
+	}
+
+	var stat unix.Stat_t
+	if err := unix.Stat(devPath, &stat); err != nil {
+		return fmt.Errorf("stat %q failed for network interface %q: %v", devPath, ep.Name(), err)
+	}
+
+	devInfo := config.DeviceInfo{
+		HostPath:      devPath,
+		ContainerPath: devPath,
+		DevType:       "c",
+		Major:         int64(unix.Major(uint64(stat.Rdev))),
+		Minor:         int64(unix.Minor(uint64(stat.Rdev))),
+		Port:          s.config.HypervisorConfig.HotPlugVFIO,
+	}
+
+	if _, err := s.AddDevice(ctx, devInfo); err != nil {
+		return fmt.Errorf("failed to hotplug VFIO device %q for network interface %q: %v", devPath, ep.Name(), err)
+	}
+
+	pciPath := s.GetVfioDeviceGuestPciPath(ep.HostBDF)
+	if pciPath.IsNil() {
+		return fmt.Errorf("PCI path for VFIO interface %q (BDF %s) not found after hotplug", ep.Name(), ep.HostBDF)
+	}
+	ep.SetPciPath(pciPath)
+
+	s.Logger().WithFields(logrus.Fields{
+		"interface": ep.Name(),
+		"host-bdf":  ep.HostBDF,
+		"device":    devPath,
+		"pci-path":  pciPath.String(),
+	}).Info("VFIO network device hotplugged")
+
+	return nil
+}
+
 // updateResources will:
 // - calculate the resources required for the virtual machine, and adjust the virtual machine
 // sizing accordingly. For a given sandbox, it will calculate the number of vCPUs required based
@@ -2847,9 +3020,26 @@ func (s *Sandbox) fetchContainers(ctx context.Context) error {
 
 // checkVCPUsPinning is used to support CPUSet mode of kata container.
 // CPUSet mode is on when Sandbox.HypervisorConfig.EnableVCPUsPinning
-// is set to true. Then it fetches sandbox's number of vCPU threads
-// and number of CPUs in CPUSet. If the two are equal, each vCPU thread
-// is then pinned to one fixed CPU in CPUSet.
+// is set to true.
+//
+// When NUMA topology is configured (GuestNUMANodes is non-empty), vCPU
+// threads are pinned to host CPUs belonging to the same host NUMA node
+// as the vCPU's assigned guest NUMA node, preserving memory locality.
+// vCPUs are distributed proportionally across nodes and each vCPU is
+// pinned round-robin to the host CPUs within its NUMA node; the 1:1
+// count equality check does not apply.
+//
+// This is true for both multi-node sandboxes and right-sized
+// single-node sandboxes: when buildNUMATopology()/maybeRightSizeAutoNUMA
+// collapses the topology to one node, that single node still carries a
+// meaningful HostCPUs subset (the CPUs of the chosen host NUMA node),
+// and pinning to that subset is what makes right-sizing actually deliver
+// host-thread locality, not just guest-topology locality.
+//
+// In the non-NUMA path (GuestNUMANodes is empty, e.g. enable_numa=false),
+// it fetches the sandbox's number of vCPU threads and number of CPUs in
+// CPUSet. If the two are equal, each vCPU thread is pinned 1:1 to the
+// CPUs in CPUSet; otherwise pinning is skipped.
 func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 	if s.config == nil {
 		return fmt.Errorf("no sandbox config found")
@@ -2858,11 +3048,39 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 		return nil
 	}
 
-	// fetch vCPU thread ids and CPUSet
+	expectedVCPUs := int(s.config.HypervisorConfig.NumVCPUs())
+
 	vCPUThreadsMap, err := s.hypervisor.GetThreadIDs(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get vCPU thread ids from hypervisor: %v", err)
 	}
+
+	// QEMU may not have spawned all vCPU threads yet. Retry with
+	// exponential backoff until we see the expected count.
+	if len(vCPUThreadsMap.vcpus) < expectedVCPUs {
+		const maxAttempts = 10
+		backoff := 50 * time.Millisecond
+		for attempt := 2; attempt <= maxAttempts && len(vCPUThreadsMap.vcpus) < expectedVCPUs; attempt++ {
+			s.Logger().WithFields(logrus.Fields{
+				"have":    len(vCPUThreadsMap.vcpus),
+				"want":    expectedVCPUs,
+				"attempt": attempt,
+			}).Debug("waiting for all vCPU threads to be available")
+			time.Sleep(backoff)
+			backoff *= 2
+			vCPUThreadsMap, err = s.hypervisor.GetThreadIDs(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get vCPU thread ids from hypervisor: %v", err)
+			}
+		}
+		if len(vCPUThreadsMap.vcpus) < expectedVCPUs {
+			s.Logger().WithFields(logrus.Fields{
+				"have": len(vCPUThreadsMap.vcpus),
+				"want": expectedVCPUs,
+			}).Warn("not all vCPU threads available after retries; pinning available ones")
+		}
+	}
+
 	cpuSetStr, _, err := s.getSandboxCPUSet()
 	if err != nil {
 		return fmt.Errorf("failed to get CPUSet config: %v", err)
@@ -2873,9 +3091,42 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 	}
 	cpuSetSlice := cpuSet.ToSlice()
 
-	// check if vCPU thread numbers and CPU numbers are equal
+	numaNodes := s.config.HypervisorConfig.GuestNUMANodes
+
+	if len(cpuSetSlice) == 0 {
+		if len(numaNodes) >= 1 {
+			// No cpuset constraint (e.g. ctr without k8s, or a Burstable
+			// pod with cpuManagerPolicy=none). Build an effective cpuset
+			// from the NUMA nodes' HostCPUs so pinning works using the
+			// (possibly right-sized) host NUMA topology. Even a single
+			// NUMA node here meaningfully constrains pinning to that
+			// node's host CPUs.
+			for _, gn := range numaNodes {
+				hostCPUs, err := cpuset.Parse(gn.HostCPUs)
+				if err != nil {
+					continue
+				}
+				cpuSet = cpuSet.Union(hostCPUs)
+			}
+			cpuSetSlice = cpuSet.ToSlice()
+			if len(cpuSetSlice) == 0 {
+				s.Logger().Warn("sandbox CPUSet is empty and cannot derive from NUMA HostCPUs; skipping vCPU pinning")
+				s.isVCPUsPinningOn = false
+				return nil
+			}
+			s.Logger().WithField("effective-cpuset", cpuSet.String()).Debug("derived cpuset from NUMA HostCPUs for pinning")
+		} else {
+			s.Logger().Warn("sandbox CPUSet is empty; skipping vCPU pinning")
+			s.isVCPUsPinningOn = false
+			return nil
+		}
+	}
+
+	if len(numaNodes) >= 1 {
+		return s.checkVCPUsPinningNUMA(ctx, vCPUThreadsMap, numaNodes, cpuSetSlice)
+	}
+
 	numVCPUs, numCPUs := len(vCPUThreadsMap.vcpus), len(cpuSetSlice)
-	// if not equal, we should reset threads scheduling to random pattern
 	if numVCPUs != numCPUs {
 		if s.isVCPUsPinningOn {
 			s.isVCPUsPinningOn = false
@@ -2883,7 +3134,6 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 		}
 		return nil
 	}
-	// if equal, we can use vCPU thread pinning
 	for i, tid := range vCPUThreadsMap.vcpus {
 		if err := resCtrl.SetThreadAffinity(tid, cpuSetSlice[i:i+1]); err != nil {
 			if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
@@ -2892,6 +3142,84 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 			return fmt.Errorf("failed to set vcpu thread %d affinity to cpu %d: %v", tid, cpuSetSlice[i], err)
 		}
 	}
+	s.isVCPUsPinningOn = true
+	return nil
+}
+
+// checkVCPUsPinningNUMA pins vCPU threads to host CPUs that belong to the
+// same NUMA node as the vCPU's guest NUMA node assignment. vCPUs are
+// distributed proportionally to the host CPU count per NUMA node
+// (matching buildNUMATopology). It handles any non-empty numaNodes
+// slice — including the right-sized single-node case, where every vCPU
+// is pinned within the single chosen host NUMA node's CPU set.
+func (s *Sandbox) checkVCPUsPinningNUMA(ctx context.Context, vCPUThreadsMap VcpuThreadIDs, numaNodes []types.GuestNUMANode, cpuSetSlice []int) error {
+	numVCPUs := uint32(len(vCPUThreadsMap.vcpus))
+	numNodes := uint32(len(numaNodes))
+
+	var vcpusPerNode []uint32
+	if numVCPUs >= numNodes {
+		var err error
+		vcpusPerNode, err = utils.DistributeVCPUsProportionally(numaNodes, numVCPUs)
+		if err != nil {
+			return fmt.Errorf("failed to compute NUMA vCPU distribution for pinning: %v", err)
+		}
+	} else {
+		// Fewer vCPUs than NUMA nodes.  This is expected when a memory-only
+		// NUMA topology is emitted to enable multi-node pxb-pcie placement
+		// for VFIO GPUs (e.g. default_vcpus=1 on a dual-socket DGX).  Give
+		// 1 vCPU to each of the first numVCPUs nodes and 0 to the rest; the
+		// loop below skips nodes with 0 vCPUs so no pinning is attempted for
+		// memory-only nodes.
+		s.Logger().WithFields(logrus.Fields{
+			"vcpus":      numVCPUs,
+			"numa-nodes": numNodes,
+		}).Warn("fewer vCPUs than NUMA nodes (memory-only topology); pinning available vCPU(s) to first node(s)")
+		vcpusPerNode = make([]uint32, numNodes)
+		for i := uint32(0); i < numVCPUs; i++ {
+			vcpusPerNode[i] = 1
+		}
+	}
+
+	cpuSetAll := cpuset.NewCPUSet(cpuSetSlice...)
+
+	var cpuOffset uint32
+	for i, gn := range numaNodes {
+		hostCPUs, err := cpuset.Parse(gn.HostCPUs)
+		if err != nil {
+			return fmt.Errorf("failed to parse HostCPUs for NUMA node %d: %v", i, err)
+		}
+		allowedCPUs := hostCPUs.Intersection(cpuSetAll).ToSlice()
+		if len(allowedCPUs) == 0 {
+			s.Logger().WithFields(logrus.Fields{
+				"numa-node":    i,
+				"host-cpus":    gn.HostCPUs,
+				"sandbox-cpus": cpuSetSlice,
+			}).Warn("NUMA node HostCPUs do not intersect sandbox CPUSet; pinning vCPUs to full cpuset for this node")
+			allowedCPUs = cpuSetSlice
+		}
+
+		startVCPU := cpuOffset
+		endVCPU := startVCPU + vcpusPerNode[i]
+		cpuOffset = endVCPU
+
+		for vcpuIdx := startVCPU; vcpuIdx < endVCPU; vcpuIdx++ {
+			tid, ok := vCPUThreadsMap.vcpus[int(vcpuIdx)]
+			if !ok {
+				if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
+					return err
+				}
+				return fmt.Errorf("missing vcpu thread id for vcpu index %d", vcpuIdx)
+			}
+			pinIdx := int(vcpuIdx-startVCPU) % len(allowedCPUs)
+			if err := resCtrl.SetThreadAffinity(tid, allowedCPUs[pinIdx:pinIdx+1]); err != nil {
+				if err := s.resetVCPUsPinning(ctx, vCPUThreadsMap, cpuSetSlice); err != nil {
+					return err
+				}
+				return fmt.Errorf("failed to set vcpu thread %d affinity to cpu %d (NUMA node %d): %v", tid, allowedCPUs[pinIdx], i, err)
+			}
+		}
+	}
+
 	s.isVCPUsPinningOn = true
 	return nil
 }

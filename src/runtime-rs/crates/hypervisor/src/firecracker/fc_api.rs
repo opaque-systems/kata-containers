@@ -12,8 +12,10 @@ use crate::{
     NetworkConfig, Param,
 };
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use dbs_utils::net::MacAddr;
-use hyper::{Body, Method, Request, Response};
+use http_body_util::{BodyExt, Full};
+use hyper::{body::Incoming, Method, Request, Response};
 use hyperlocal::Uri;
 use kata_sys_util::mount;
 use kata_types::config::hypervisor::RateLimiterConfig;
@@ -111,7 +113,7 @@ impl FcInner {
 
         let body_config: String = json!({
             "mem_size_mib": self.config.memory_info.default_memory,
-            "vcpu_count": self.config.cpu_info.default_vcpus,
+            "vcpu_count": self.config.cpu_info.default_vcpus.ceil() as u8,
         })
         .to_string();
         let body_kernel: String = json!({
@@ -191,13 +193,10 @@ impl FcInner {
                 .disk_rate_limiter_ops_one_time_burst,
         );
 
-        let rate_limiter = serde_json::to_string(&block_rate_limit)
-            .with_context(|| format!("serde {block_rate_limit:?} to json"))?;
-
         let body: String = json!({
             "drive_id": format!("drive{drive_id}"),
             "path_on_host": new_drive_path,
-            "rate_limiter": rate_limiter,
+            "rate_limiter": block_rate_limit,
         })
         .to_string();
         self.request_with_retry(
@@ -259,7 +258,7 @@ impl FcInner {
                 .uri(uri.clone())
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json")
-                .body(Body::from(data.clone()))?;
+                .body(Full::new(Bytes::from(data.clone())))?;
 
             match self.send_request(req).await {
                 Ok(resp) => {
@@ -279,7 +278,10 @@ impl FcInner {
         ))
     }
 
-    pub(crate) async fn send_request(&self, req: Request<Body>) -> Result<Response<Body>> {
+    pub(crate) async fn send_request(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<Response<Incoming>> {
         let resp = self.client.request(req).await?;
 
         let status = resp.status();
@@ -287,7 +289,7 @@ impl FcInner {
         if status.is_success() {
             return Ok(resp);
         } else {
-            let body = hyper::body::to_bytes(resp.into_body()).await?;
+            let body = resp.into_body().collect().await?.to_bytes();
             if body.is_empty() {
                 debug!(sl(), "Request FAILED WITH STATUS: {:?}", status);
                 None

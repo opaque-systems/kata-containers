@@ -148,6 +148,35 @@ func TestSetEphemeralStorageType(t *testing.T) {
 		"Unexpected mount type, got %s expected ephemeral", mountType)
 }
 
+func TestSetEphemeralStorageTypeHostEmptyDirModes(t *testing.T) {
+	assert := assert.New(t)
+
+	dir := t.TempDir()
+	emptyDirPath := filepath.Join(dir, vc.K8sEmptyDir, "disk-volume")
+	err := os.MkdirAll(emptyDirPath, testDirMode)
+	assert.NoError(err)
+
+	newSpec := func() specs.Spec {
+		return specs.Spec{
+			Mounts: []specs.Mount{
+				{
+					Source: emptyDirPath,
+					Type:   "bind",
+				},
+			},
+		}
+	}
+
+	ociSpec := SetEphemeralStorageType(newSpec(), false, vc.EmptyDirModeSharedFs)
+	assert.Equal(vc.KataLocalDevType, ociSpec.Mounts[0].Type)
+
+	ociSpec = SetEphemeralStorageType(newSpec(), false, vc.EmptyDirModeVirtioBlkEncrypted)
+	assert.Equal("bind", ociSpec.Mounts[0].Type)
+
+	ociSpec = SetEphemeralStorageType(newSpec(), false, vc.EmptyDirModeVirtioBlkPlain)
+	assert.Equal("bind", ociSpec.Mounts[0].Type)
+}
+
 func TestSetKernelParams(t *testing.T) {
 	assert := assert.New(t)
 
@@ -430,9 +459,11 @@ func TestVfioChecksClh(t *testing.T) {
 	}
 	assert.NoError(f(config.NoPort, config.NoPort))
 	assert.NoError(f(config.NoPort, config.RootPort))
+	assert.NoError(f(config.RootPort, config.NoPort))
 	assert.Error(f(config.RootPort, config.RootPort))
-	assert.Error(f(config.RootPort, config.NoPort))
 	assert.Error(f(config.NoPort, config.SwitchPort))
+	assert.Error(f(config.SwitchPort, config.NoPort))
+	assert.Error(f(config.BridgePort, config.NoPort))
 }
 
 func TestVfioCheckQemu(t *testing.T) {

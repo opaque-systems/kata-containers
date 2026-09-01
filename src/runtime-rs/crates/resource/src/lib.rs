@@ -18,7 +18,7 @@ mod manager_inner;
 pub mod network;
 pub mod resource_persist;
 use hypervisor::{
-    BlockConfig, HybridVsockConfig, PortDeviceConfig, ProtectionDeviceConfig, VsockConfig,
+    BlockConfigModern, HybridVsockConfig, PortDeviceConfig, ProtectionDeviceConfig, VsockConfig, vfio_device::VfioDeviceBase,
 };
 use network::NetworkConfig;
 pub mod rootfs;
@@ -35,12 +35,14 @@ use kata_types::config::hypervisor::SharedFsInfo;
 pub enum ResourceConfig {
     Network(NetworkConfig),
     ShareFs(SharedFsInfo),
-    VmRootfs(BlockConfig),
+    VmRootfs(BlockConfigModern),
+    GuestExtensionImage(BlockConfigModern),
     HybridVsock(HybridVsockConfig),
     Vsock(VsockConfig),
     Protection(ProtectionDeviceConfig),
+    VfioDeviceModern(VfioDeviceBase),
     PortDevice(PortDeviceConfig),
-    InitData(BlockConfig),
+    InitData(BlockConfigModern),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

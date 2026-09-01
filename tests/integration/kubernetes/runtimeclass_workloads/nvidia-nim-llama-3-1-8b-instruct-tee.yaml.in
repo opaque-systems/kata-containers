@@ -16,14 +16,17 @@ metadata:
     # cc_init_data annotation will be added by genpolicy with CDH configuration
     # from the custom default-initdata.toml created by create_nim_initdata_file()
 spec:
+  # Explicit user/group IDs keep guest-pull requests aligned with policy.
+  # See docs/Limitations.md#guest-pulled-container-images.
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    supplementalGroups: [4, 20, 24, 25, 27, 29, 30, 44, 46]
   restartPolicy: Never
   runtimeClassName: kata
   imagePullSecrets:
     - name: ngc-secret-instruct
-  securityContext:
-    runAsUser: 0
-    runAsGroup: 0
-    fsGroup: 0
   containers:
   - name: ${POD_NAME_INSTRUCT}
     image: nvcr.io/nim/meta/llama-3.1-8b-instruct:1.13.1
@@ -69,7 +72,20 @@ spec:
       limits:
         nvidia.com/pgpu: "1"
         cpu: "16"
-        memory: "128Gi"
+        memory: "48Gi"
+    volumeMounts:
+      - name: nim-trusted-cache
+        mountPath: /opt/nim/.cache
+    volumeDevices:
+      - devicePath: /dev/trusted_store
+        name: trusted-storage
+  volumes:
+  - name: nim-trusted-cache
+    emptyDir:
+      sizeLimit: 64Gi
+  - name: trusted-storage
+    persistentVolumeClaim:
+      claimName: trusted-pvc-instruct
 ---
 apiVersion: v1
 kind: Secret

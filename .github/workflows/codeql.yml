@@ -19,6 +19,10 @@ on:
   schedule:
     - cron: '45 0 * * 1'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 
@@ -32,14 +36,9 @@ jobs:
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ubuntu-24.04
     permissions:
-      # required for all workflows
-      security-events: write
-
-      # required to fetch internal or private CodeQL packs
-      packages: read
-
-      # only required for workflows in private repositories
-      actions: read
+      security-events: write # required to upload SARIF results to code-scanning dashboard
+      packages: read # required to fetch internal or private CodeQL packs
+      actions: read # required to fetch workflow run information
       contents: read
 
     strategy:
@@ -60,7 +59,7 @@ jobs:
         # your codebase is analyzed, see https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages
     steps:
     - name: Checkout repository
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         persist-credentials: false
 

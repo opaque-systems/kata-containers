@@ -9,23 +9,27 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
-# Currently only the Go runtime provides the config path used here.
-# If a Rust hypervisor runs this test, mirror the enabling_hypervisor
-# pattern in tests/common.bash to select the correct runtime-rs config.
-shim_config_file="/opt/kata/share/defaults/kata-containers/configuration-${KATA_HYPERVISOR}.toml"
+case "${KATA_HYPERVISOR}" in
+	*-runtime-rs)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtime-rs/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+	*)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+esac
 
 check_and_skip() {
-	case "${KATA_HYPERVISOR}" in
-		qemu-tdx|qemu-coco-dev)
-			if [ "$(uname -m)" == "s390x" ]; then
-				skip "measured rootfs tests not implemented for s390x"
-			fi
-			return
-			;;
-		*)
-			skip "measured rootfs tests not implemented for hypervisor: $KATA_HYPERVISOR"
-			;;
-	esac
+	# The CPU-only NVIDIA classes are not confidential, but they still boot
+	# the verity-backed nvidia base image, so measured rootfs applies to them
+	# just like it does to the confidential classes.
+	if is_verity_enabled_runtime_class "${KATA_HYPERVISOR}"; then
+		if [[ "$(uname -m)" == "s390x" ]]; then
+			skip "measured rootfs tests not implemented for s390x"
+		fi
+		return
+	fi
+
+	skip "measured rootfs tests not implemented for hypervisor: ${KATA_HYPERVISOR}"
 }
 
 setup() {
@@ -35,7 +39,13 @@ setup() {
 }
 
 @test "Test cannot launch pod with measured boot enabled and incorrect hash" {
-	pod_config="$(new_pod_config nginx "kata-${KATA_HYPERVISOR}")"
+	ensure_yq
+	nginx_registry=$(get_from_kata_deps ".docker_images.nginx.registry")
+	nginx_digest=$(get_from_kata_deps ".docker_images.nginx.digest")
+	nginx_image="${nginx_registry}@${nginx_digest}"
+
+	pod_config="$(new_pod_config "${nginx_image}" "kata-${KATA_HYPERVISOR}" \
+		"" "" "1, 2, 3, 4, 6, 10, 11, 20, 26, 27")"
 	auto_generate_policy "${pod_config_dir}" "${pod_config}"
 
 	incorrect_hash="1111111111111111111111111111111111111111111111111111111111111111"

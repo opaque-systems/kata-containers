@@ -8,7 +8,7 @@
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-nvidia-gpu-runtime-rs}"
 
 TEE=false
 if is_confidential_gpu_hardware; then
@@ -28,14 +28,6 @@ setup() {
     pod_yaml="${pod_config_dir}/${POD_NAME_CUDA}.yaml"
 
     envsubst < "${pod_yaml_in}" > "${pod_yaml}"
-
-    if [ "${TEE}" = "true" ]; then
-        kernel_params_annotation="io.katacontainers.config.hypervisor.kernel_params"
-        kernel_params_value="nvrc.smi.srs=1"
-        set_metadata_annotation "${pod_yaml}" \
-            "${kernel_params_annotation}" \
-            "${kernel_params_value}"
-    fi
 
     policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
     add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"

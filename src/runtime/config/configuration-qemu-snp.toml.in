@@ -15,7 +15,7 @@
 [hypervisor.qemu]
 path = "@QEMUPATH@"
 kernel = "@KERNELCONFIDENTIALPATH@"
-initrd = "@INITRDCONFIDENTIALPATH@"
+image = "@IMAGECONFIDENTIALPATH@"
 machine_type = "@MACHINETYPE@"
 
 # rootfs filesystem type:
@@ -90,6 +90,11 @@ snp_guest_policy = 196608
 # To see the list of default parameters, enable hypervisor debug, create a
 # container and look for 'default-kernel-parameters' log entries.
 kernel_params = "@KERNELPARAMS@"
+
+# Optional dm-verity parameters (comma-separated key=value list):
+# root_hash=...,salt=...,data_blocks=...,data_block_size=...,hash_block_size=...
+# These are used by the runtime to assemble dm-verity kernel params.
+kernel_verity_params = "@KERNELVERITYPARAMS@"
 
 # Path to the firmware.
 # If you want that qemu uses the default firmware leave this option empty
@@ -281,6 +286,16 @@ block_device_cache_direct = false
 # Default false
 block_device_cache_noflush = false
 
+# Specifies the logical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_logical_sector_size = 0
+
+# Specifies the physical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_physical_sector_size = 0
+
 # Enable iothreads (data-plane) to be used. This causes IO to be
 # handled in a separate IO thread. This is currently implemented
 # for virtio-scsi and virtio-blk.
@@ -363,17 +378,6 @@ valid_vhost_user_store_paths = @DEFVALIDVHOSTUSERSTOREPATHS@
 # qemu will delay this many seconds and then attempt to reconnect.
 # Zero disables reconnecting, and the default is zero.
 vhost_user_reconnect_timeout_sec = 0
-
-# Enable file based guest memory support. The default is an empty string which
-# will disable this feature. In the case of virtio-fs, this is enabled
-# automatically and '/dev/shm' is used as the backing folder.
-# This option will be ignored if VM templating is enabled.
-file_mem_backend = ""
-
-# List of valid annotations values for the file_mem_backend annotation
-# The default if not set is empty (all annotations rejected.)
-# Your distribution recommends: @DEFVALIDFILEMEMBACKENDS@
-valid_file_mem_backends = @DEFVALIDFILEMEMBACKENDS@
 
 # -pflash can add image file to VM. The arguments of it should be in format
 # of ["/path/to/flash0.img", "/path/to/flash1.img"]
@@ -588,6 +592,11 @@ debug_console_enabled = false
 # (default: 90)
 dial_timeout = 90
 
+# Timeout in seconds for guest components (attestation-agent, confidential-data-hub)
+# to create their Unix sockets after being spawned by the agent.
+# (agent default when unset: 6)
+launch_process_timeout = 6
+
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
 # system log
@@ -713,6 +722,9 @@ disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 #
 #   - block-encrypted
 #     Plugs a block device to be encrypted in the guest.
+#
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
 #
 emptydir_mode = "@DEFEMPTYDIRMODE_COCO@"
 

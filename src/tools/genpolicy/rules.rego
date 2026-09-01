@@ -9,8 +9,12 @@ import future.keywords.in
 import future.keywords.every
 import future.keywords.if
 
+# GetDiagnosticDataRequest is not supported yet when using the CoCo policy unless enabled in policy_data.request_defaults.
+default GetDiagnosticDataRequest := false
+
 # Default values, returned by OPA when rules cannot be evaluated to true.
 default AddARPNeighborsRequest := false
+default AddSwapPathRequest := false
 default AddSwapRequest := false
 default CloseStdinRequest := false
 default CopyFileRequest := false
@@ -18,10 +22,14 @@ default CreateContainerRequest := false
 default CreateSandboxRequest := false
 default DestroySandboxRequest := true
 default ExecProcessRequest := false
+default GetIPTablesRequest := false
+default GetMetricsRequest := false
 default GetOOMEventRequest := true
 default GuestDetailsRequest := true
 default ListInterfacesRequest := false
 default ListRoutesRequest := false
+default MemAgentCompactConfig := false
+default MemAgentMemcgConfig := false
 default MemHotplugByProbeRequest := false
 default OnlineCPUMemRequest := true
 default PauseContainerRequest := false
@@ -29,8 +37,10 @@ default ReadStreamRequest := false
 default RemoveContainerRequest := true
 default RemoveStaleVirtiofsShareMountsRequest := true
 default ReseedRandomDevRequest := false
+default ResizeVolumeRequest := false
 default ResumeContainerRequest := false
 default SetGuestDateTimeRequest := false
+default SetIPTablesRequest := false
 default SetPolicyRequest := false
 default SignalProcessRequest := true
 default StartContainerRequest := true
@@ -42,6 +52,7 @@ default UpdateContainerRequest := false
 default UpdateEphemeralMountsRequest := false
 default UpdateInterfaceRequest := false
 default UpdateRoutesRequest := false
+default VolumeStatsRequest := false
 default WaitProcessRequest := true
 default WriteStreamRequest := false
 
@@ -1258,6 +1269,33 @@ check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
     print("check_mount 3: true")
 }
 
+check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
+    # Unified cgroup v2 mounts on newer kernels may add flags genpolicy does not
+    # embed (e.g. nsdelegate, memory_recursiveprot). Allow extras listed in
+    # policy_data.cluster_config.cgroup_mount_extras_allowed (from genpolicy-settings.json).
+    i_mount.type_ == "cgroup"
+    p_mount.type_ == "cgroup"
+    p_mount.destination == i_mount.destination
+    p_mount.source == i_mount.source
+
+    allowed_extras := {x | x = policy_data.cluster_config.cgroup_mount_extras_allowed[_]}
+
+    p_opts := {x | x = p_mount.options[_]}
+    i_opts := {x | x = i_mount.options[_]}
+    every opt in p_mount.options {
+        opt in i_opts
+    }
+
+    extras := i_opts - p_opts
+    every extra in extras {
+        extra in allowed_extras
+    }
+
+    mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id)
+
+    print("check_mount 4: true")
+}
+
 mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
     regex1 := p_mount.source
     print("mount_source_allows 1: regex1 =", regex1)
@@ -1349,7 +1387,7 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage with blk: start")
 
     i_storage.driver == "blk"
-    regex.match("^[0-9]{2}/[0-9]{2}$", i_storage.source)
+    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
 
     allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
 
@@ -1411,6 +1449,7 @@ allow_storage_source(p_storage, i_storage, bundle_id) if {
 allow_storage_options(p_storage, i_storage) if {
     print("allow_storage_options 1: start")
 
+    p_storage.driver != "blk"
     p_storage.driver != "overlayfs"
     p_storage.options == i_storage.options
 
@@ -1494,7 +1533,7 @@ allow_mount_point_by_device_id(p_storage, i_storage) if {
     mount3 := replace(mount2, "$(b64_device_id)", base64url.encode(i_storage.source))
     print("allow_mount_point_by_device_id: mount3 =", mount3)
 
-    regex.match(mount3, i_storage.mount_point)
+    mount3 == i_storage.mount_point
 
     print("allow_mount_point_by_device_id: true")
 }
@@ -1594,7 +1633,7 @@ strip_cap_prefix(s) := result if {
 }
 
 check_directory_traversal(i_path) if {
-    not regex.match("(^|/)..($|/)", i_path)
+    not regex.match("(^|/)\\.\\.($|/)", i_path)
 }
 
 allow_sandbox_storages(i_storages) if {
@@ -1619,19 +1658,55 @@ allow_sandbox_storage(p_storages, i_storage) if {
 }
 
 CopyFileRequest if {
-    print("CopyFileRequest: input.path =", input.path)
+    print("CopyFileRequest: input =", input)
 
-    check_directory_traversal(input.path)
+    allow_copy_file
+
+    print("CopyFileRequest: true")
+}
+
+allow_copy_file if {
+    print("allow_copy_file regular")
+
+    input.file_type == "Regular"
+    allow_copy_file_path(input.path, "")
+
+    print("allow_copy_file regular: true")
+}
+
+allow_copy_file if {
+    print("allow_copy_file directory")
+
+    input.file_type == "Directory"
+    allow_copy_file_path(input.path, "")
+
+    print("allow_copy_file directory: true")
+}
+
+allow_copy_file if {
+    print("allow_copy_file symlink")
+
+    input.file_type == "Symlink"
+    # Symlinks are not allowed on the top-level of the shared directory, from which we mount.
+    allow_copy_file_path(input.path, ".*/.+")
+    # Symlinks must be normalized.
+    check_directory_traversal(input.symlink_target)
+    # Symlinks must be relative.
+    not startswith(input.symlink_target, "/")
+
+    print("allow_copy_file symlink: true")
+}
+
+allow_copy_file_path(path, regex_suffix) if {
+    check_directory_traversal(path)
 
     some regex1 in policy_data.request_defaults.CopyFileRequest
     regex2 := replace(regex1, "$(sfprefix)", policy_data.common.sfprefix)
     regex3 := replace(regex2, "$(cpath)", policy_data.common.cpath)
     regex4 := replace(regex3, "$(bundle-id)", "[a-z0-9]{64}")
-    print("CopyFileRequest: regex4 =", regex4)
-
-    regex.match(regex4, input.path)
-
-    print("CopyFileRequest: true")
+    regex5 := concat("", [regex4, regex_suffix])
+    print("allow_copy_file_path: regex5 =", regex5)
+    regex.match(regex5, path)
 }
 
 CreateSandboxRequest if {
@@ -1786,7 +1861,7 @@ AddARPNeighborsRequest if {
         every p_cidr in p_defaults.forbidden_cidrs_regex {
             not regex.match(p_cidr, i_neigh.toIPAddress.address)
         }
-        i_neigh.state == 128
+        i_neigh.state in p_defaults.allowed_states
         bits.or(i_neigh.flags, 136) == 136
     }
 
@@ -1807,6 +1882,10 @@ UpdateEphemeralMountsRequest if {
 
 WriteStreamRequest if {
     policy_data.request_defaults.WriteStreamRequest == true
+}
+
+GetDiagnosticDataRequest if {
+    policy_data.request_defaults.GetDiagnosticDataRequest == true
 }
 
 RemoveContainerRequest:= {"ops": ops, "allowed": true} if {

@@ -11,7 +11,7 @@ mod resource_inner;
 mod utils;
 
 use anyhow::{anyhow, Result};
-use cgroups_rs::manager::is_systemd_cgroup;
+use cgroups::manager::is_systemd_cgroup;
 use hypervisor::HYPERVISOR_DRAGONBALL;
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::config::TomlConfig;
@@ -29,6 +29,7 @@ pub struct CgroupConfig {
     pub path: String,
     pub overhead_path: String,
     pub sandbox_cgroup_only: bool,
+    pub enable_vcpus_pinning: bool,
 }
 
 impl CgroupConfig {
@@ -59,10 +60,13 @@ impl CgroupConfig {
             toml_config.runtime.sandbox_cgroup_only
         };
 
+        let enable_vcpus_pinning = toml_config.runtime.enable_vcpus_pinning;
+
         Ok(Self {
             path,
             overhead_path,
             sandbox_cgroup_only,
+            enable_vcpus_pinning,
         })
     }
 
@@ -80,6 +84,7 @@ impl CgroupConfig {
             path: path.clone(),
             overhead_path: overhead_path.clone(),
             sandbox_cgroup_only: state.sandbox_cgroup_only,
+            enable_vcpus_pinning: state.enable_vcpus_pinning,
         })
     }
 }

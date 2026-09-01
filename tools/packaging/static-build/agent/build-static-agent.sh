@@ -10,6 +10,7 @@ set -o pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=/dev/null
 source "${script_dir}/../../scripts/lib.sh"
 
 build_agent_from_source() {
@@ -17,9 +18,11 @@ build_agent_from_source() {
 
 	/usr/bin/install_libseccomp.sh /opt /opt
 
+	# Note: when USE_DEVMAPPER=yes the agent Makefile overrides LIBC=gnu
 	cd src/agent
-	DESTDIR=${DESTDIR} AGENT_POLICY=${AGENT_POLICY} INIT_DATA=${INIT_DATA} make
-	DESTDIR=${DESTDIR} AGENT_POLICY=${AGENT_POLICY} INIT_DATA=${INIT_DATA} make install
+	# shellcheck disable=SC2154
+	DESTDIR="${DESTDIR}" AGENT_POLICY="${AGENT_POLICY}" INIT_DATA="${INIT_DATA}" USE_DEVMAPPER="${USE_DEVMAPPER:-no}" make
+	DESTDIR="${DESTDIR}" AGENT_POLICY="${AGENT_POLICY}" INIT_DATA="${INIT_DATA}" USE_DEVMAPPER="${USE_DEVMAPPER:-no}" make install
 }
 
 build_agent_from_source "$@"

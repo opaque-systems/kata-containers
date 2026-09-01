@@ -12,6 +12,7 @@ use agent::{
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use common::error::is_normal_oom_shutdown_error;
 use common::types::utils::option_system_time_into;
 use common::types::ContainerProcess;
 use common::{
@@ -24,17 +25,29 @@ use common::{
 };
 
 use containerd_shim_protos::events::task::{TaskExit, TaskOOM};
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use hypervisor::ch::CloudHypervisor;
+use hypervisor::device::topology::PCIePort;
+use hypervisor::device::util::{get_host_path, DEVICE_TYPE_CHAR};
+use hypervisor::remote::Remote;
+use hypervisor::{BlockConfigModern, Hypervisor, VfioDeviceBase, is_vfio_ap_device};
 use hypervisor::VsockConfig;
-use hypervisor::HYPERVISOR_FIRECRACKER;
 use hypervisor::HYPERVISOR_REMOTE;
-#[cfg(feature = "dragonball")]
+#[cfg(all(
+    feature = "dragonball",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{
     utils::{get_hvsock_path, uses_native_ccw_bus},
     HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID,
 };
-use hypervisor::{BlockConfig, Hypervisor};
 use hypervisor::{BlockDeviceAio, PortDeviceConfig};
 use hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 use kata_sys_util::hooks::HookStates;
@@ -42,11 +55,17 @@ use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::capabilities::CapabilityBits;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+#[cfg(all(
+    feature = "cloud-hypervisor",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
+use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_BLK_PCI};
 use kata_types::config::{hypervisor::Factory, TomlConfig};
 use kata_types::initdata::{calculate_initdata_digest, ProtectedPlatform};
 use oci_spec::runtime as oci;
 use persist::{self, sandbox_persist::Persist};
+use pod_resources_rs::handle_cdi_devices;
 use protobuf::SpecialFields;
 use resource::coco_data::initdata::{
     kata_shared_init_data_path, InitDataConfig, KATA_INIT_DATA_IMAGE,
@@ -56,10 +75,13 @@ use resource::manager::ManagerArgs;
 use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, NetworkWithNetNsConfig};
 use resource::{ResourceConfig, ResourceManager};
 use runtime_spec as spec;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use strum::Display;
-use tokio::sync::{mpsc::Sender, Mutex, RwLock};
+use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub(crate) const VIRTCONTAINER: &str = "virt_container";
@@ -77,14 +99,33 @@ pub enum SandboxState {
     Stopped,
 }
 
+impl SandboxState {
+    fn to_cri_state(self) -> &'static str {
+        match self {
+            SandboxState::Running => "SANDBOX_READY",
+            SandboxState::Init | SandboxState::Stopped => "SANDBOX_NOTREADY",
+        }
+    }
+}
+
 struct SandboxInner {
     state: SandboxState,
+    exit_info: Option<SandboxExitInfo>,
+    created_at: Option<SystemTime>,
+    // Whether sandbox resources (cgroup, network, mounts, ...) have already
+    // been released.  Teardown can be driven both by the sandbox container
+    // exiting and by an explicit shutdown RPC, so guard against running the
+    // cleanup twice.
+    cleaned: bool,
 }
 
 impl SandboxInner {
     pub fn new() -> Self {
         Self {
             state: SandboxState::Init,
+            exit_info: None,
+            created_at: None,
+            cleaned: false,
         }
     }
 }
@@ -98,9 +139,11 @@ pub struct VirtSandbox {
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
     monitor: Arc<HealthCheck>,
+    exit_notify_tx: watch::Sender<bool>,
     sandbox_config: Option<SandboxConfig>,
     shm_size: u64,
     factory: Option<Factory>,
+    cancel_token: CancellationToken,
 }
 
 impl std::fmt::Debug for VirtSandbox {
@@ -113,6 +156,7 @@ impl std::fmt::Debug for VirtSandbox {
             .field("agent", &"<Agent>")
             .field("hypervisor", &self.hypervisor)
             .field("monitor", &"<HealthCheck>")
+            .field("exit_notify_tx", &"<watch::Sender<bool>>")
             .field("sandbox_config", &self.sandbox_config)
             .field("factory", &self.factory)
             .finish()
@@ -131,6 +175,8 @@ impl VirtSandbox {
     ) -> Result<Self> {
         let config = resource_manager.config().await;
         let keep_abnormal = config.runtime.keep_abnormal;
+        let (exit_notify_tx, _) = watch::channel(false);
+        let cancel_token = CancellationToken::new();
         Ok(Self {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(msg_sender)),
@@ -139,9 +185,11 @@ impl VirtSandbox {
             hypervisor,
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
+            exit_notify_tx,
             shm_size: sandbox_config.shm_size,
             sandbox_config: Some(sandbox_config),
             factory: Some(factory),
+            cancel_token,
         })
     }
 
@@ -157,11 +205,25 @@ impl VirtSandbox {
         self.hypervisor.clone()
     }
 
+    async fn record_stop(&self, exit_status: u32, exited_at: std::time::SystemTime) {
+        let mut inner = self.inner.write().await;
+        if inner.state == SandboxState::Stopped {
+            return;
+        }
+
+        inner.state = SandboxState::Stopped;
+        inner.exit_info = Some(SandboxExitInfo {
+            exit_status,
+            exited_at: Some(exited_at),
+        });
+        let _ = self.exit_notify_tx.send(true);
+    }
+
     #[instrument]
     async fn prepare_for_start_sandbox(
         &self,
         id: &str,
-        network_env: SandboxNetworkEnv,
+        sandbox_config: &SandboxConfig,
     ) -> Result<Vec<ResourceConfig>> {
         let mut resource_configs = vec![];
 
@@ -172,6 +234,7 @@ impl VirtSandbox {
             .context("failed to prepare vm socket config")?;
         resource_configs.push(vm_socket_config);
 
+        let network_env: SandboxNetworkEnv = sandbox_config.network_env.clone();
         // prepare network config
         if !network_env.network_created {
             if let Some(network_resource) = self.prepare_network_resource(&network_env).await {
@@ -194,6 +257,15 @@ impl VirtSandbox {
             resource_configs.push(vm_rootfs);
         }
 
+        // prepare extra extension image device configs (e.g. CoCo extension)
+        let extra_configs = self
+            .prepare_guest_extension_images_config()
+            .await
+            .context("failed to prepare extra images device config")?;
+        for block_config in extra_configs {
+            resource_configs.push(ResourceConfig::GuestExtensionImage(block_config));
+        }
+
         // prepare protection device config
         let init_data = if let Some(initdata) = self
             .prepare_initdata_device_config(&self.hypervisor.hypervisor_config().await)
@@ -206,6 +278,35 @@ impl VirtSandbox {
         } else {
             None
         };
+
+        // Cold-plug VFIO devices using two mutually exclusive paths:
+        // 1. CDI path: Query Kubernetes Pod Resources API for devices managed by device plugins
+        //    (typical in K8s environments with device plugins)
+        // 2. Raw VFIO path: Parse OCI spec's linux.devices for directly specified VFIO devices
+        //    (typical in standalone containers like `ctr --device /dev/vfio/0`)
+        //
+        // These paths are mutually exclusive from a user perspective:
+        // - In K8s, devices come through device plugins, not raw OCI device specs
+        // - In standalone containers, there's no Pod Resources API available
+        //
+        // Therefore, we only attempt the raw VFIO path if CDI finds no devices,
+        // avoiding unnecessary file I/O and OCI spec parsing in the common K8s case.
+        let mut vfio_devices = self.prepare_coldplug_cdi_devices(sandbox_config).await?;
+        if vfio_devices.is_empty() {
+            let raw_vfio = self
+                .prepare_coldplug_raw_vfio_devices(sandbox_config)
+                .await?;
+            vfio_devices.extend(raw_vfio);
+        }
+        if !vfio_devices.is_empty() {
+            info!(
+                sl!(),
+                "prepare pod devices {vfio_devices:?} for sandbox done."
+            );
+            resource_configs.extend(vfio_devices);
+        } else {
+            info!(sl!(), "no pod devices to prepare for sandbox.");
+        }
 
         // prepare protection device config
         if let Some(protection_dev_config) = self
@@ -252,6 +353,189 @@ impl VirtSandbox {
         }
     }
 
+    async fn prepare_coldplug_cdi_devices(
+        &self,
+        sandbox_config: &SandboxConfig,
+    ) -> Result<Vec<ResourceConfig>> {
+        let hypervisor_config = self.hypervisor.hypervisor_config().await;
+        let cold_plug_vfio = &hypervisor_config.device_info.cold_plug_vfio;
+        if cold_plug_vfio.is_empty() || cold_plug_vfio == "no-port" {
+            return Ok(Vec::new());
+        }
+
+        let port = match cold_plug_vfio.as_str() {
+            "root-port" => PCIePort::RootPort,
+            other => {
+                return Err(anyhow!(
+                    "unsupported cold_plug_vfio value {:?}; only \"root-port\" is supported",
+                    other
+                ))
+            }
+        };
+
+        let config = self.resource_manager.config().await;
+
+        // Collect the VFIO device nodes to cold-plug from two sources so that Kubernetes, docker,
+        // and nerdctl are handled by the same path:
+        //
+        //   1. Kubernetes: the kubelet PodResources API enumerates the CDI devices allocated to the
+        //      pod.
+        //   2. Docker/nerdctl: the CDI runtime applies the device's containerEdits directly to the
+        //      OCI spec, so the VFIO nodes show up in linux.devices (e.g. /dev/vfio/devices/vfio0).
+        let mut paths: Vec<String> = Vec::new();
+
+        let pod_resource_socket = &config.runtime.pod_resource_api_sock;
+        info!(
+            sl!(),
+            "sandbox pod_resource_socket: {:?}", pod_resource_socket
+        );
+        if !pod_resource_socket.is_empty() && Path::new(pod_resource_socket).exists() {
+            let annotations = &sandbox_config.annotations;
+            debug!(
+                sl!(),
+                "cold-plug: sandbox-name={:?} sandbox-namespace={:?}",
+                annotations.get("io.kubernetes.cri.sandbox-name"),
+                annotations.get("io.kubernetes.cri.sandbox-namespace")
+            );
+
+            let cdi_devices = pod_resources_rs::pod_resources::get_pod_cdi_devices(
+                pod_resource_socket,
+                annotations,
+            )
+            .await
+            .context("failed to query Pod Resources CDI devices")?;
+            info!(sl!(), "pod cdi devices: {:?}", cdi_devices);
+
+            let device_nodes = handle_cdi_devices(&cdi_devices).await?;
+            paths.extend(
+                device_nodes
+                    .iter()
+                    .filter_map(pod_resources_rs::device_node_host_path),
+            );
+        }
+
+        paths.extend(oci_spec_vfio_device_paths());
+
+        // De-duplicate while preserving discovery order.
+        let mut seen = HashSet::new();
+        paths.retain(|path| seen.insert(path.clone()));
+
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut vfio_configs = Vec::new();
+        for path in paths.iter() {
+            let dev_info = VfioDeviceBase {
+                host_path: path.clone(),
+                iommu_group_devnode: PathBuf::from(path),
+                dev_type: "c".to_string(),
+                port,
+                hostdev_prefix: "vfio_device".to_owned(),
+                ..Default::default()
+            };
+            vfio_configs.push(dev_info);
+        }
+
+        Ok(vfio_configs
+            .into_iter()
+            .map(ResourceConfig::VfioDeviceModern)
+            .collect())
+    }
+
+    // Fallback cold-plug path for standalone containers (e.g. `ctr --device /dev/vfio/0`).
+    // Reads the OCI spec from the bundle and cold-plugs any VFIO char devices found in
+    // linux.devices before VM boot, mirroring Go's coldOrHotPlugVFIO().
+    // Returns empty when the pod resources API path already handles devices (K8s) or
+    // when cold_plug_vfio is not configured.
+    async fn prepare_coldplug_raw_vfio_devices(
+        &self,
+        sandbox_config: &SandboxConfig,
+    ) -> Result<Vec<ResourceConfig>> {
+        let hypervisor_config = self.hypervisor.hypervisor_config().await;
+        let cold_plug_vfio = &hypervisor_config.device_info.cold_plug_vfio;
+        if cold_plug_vfio.is_empty() || cold_plug_vfio == "no-port" {
+            return Ok(Vec::new());
+        }
+
+        let port = match cold_plug_vfio.as_str() {
+            "root-port" => PCIePort::RootPort,
+            other => {
+                return Err(anyhow!(
+                    "unsupported cold_plug_vfio value {:?}; only \"root-port\" is supported",
+                    other
+                ))
+            }
+        };
+
+        let bundle = &sandbox_config.state.bundle;
+        if bundle.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let spec_path = format!("{}/{}", bundle, spec::OCI_SPEC_CONFIG_FILE_NAME);
+        let oci_spec = match oci::Spec::load(&spec_path) {
+            Ok(s) => s,
+            Err(e) => {
+                info!(
+                    sl!(),
+                    "no OCI spec at {:?}: {:?}, skipping raw VFIO cold-plug", spec_path, e
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let linux_devices = oci_spec
+            .linux()
+            .as_ref()
+            .and_then(|l| l.devices().as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut vfio_configs = Vec::new();
+        for d in linux_devices.iter() {
+            if d.typ() != oci::LinuxDeviceType::C {
+                continue;
+            }
+            let host_path = match get_host_path(DEVICE_TYPE_CHAR, d.major(), d.minor()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        sl!(),
+                        "failed to resolve host path for {:?}: {:?}",
+                        d.path(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            // Only process VFIO passthrough devices under /dev/vfio/*.
+            // Skip non-VFIO devices and the legacy VFIO control node (/dev/vfio/vfio).
+            if !host_path.starts_with("/dev/vfio/") || host_path == "/dev/vfio/vfio" {
+                continue;
+            }
+            let device_port = if is_vfio_ap_device(Path::new(&host_path)) {
+                PCIePort::NoPort
+            } else {
+                port
+            };
+            vfio_configs.push(VfioDeviceBase {
+                host_path: host_path.clone(),
+                iommu_group_devnode: PathBuf::from(&host_path),
+                dev_type: "c".to_string(),
+                port: device_port,
+                hostdev_prefix: "vfio_device".to_owned(),
+                ..Default::default()
+            });
+        }
+        info!(sl!(), "raw VFIO cold-plug candidates: {:?}", vfio_configs);
+
+        Ok(vfio_configs
+            .into_iter()
+            .map(ResourceConfig::VfioDeviceModern)
+            .collect())
+    }
+
     async fn prepare_network_resource(
         &self,
         network_env: &SandboxNetworkEnv,
@@ -264,6 +548,12 @@ impl VirtSandbox {
             Some(ResourceConfig::Network(NetworkConfig::Dan(
                 DanNetworkConfig {
                     dan_conf_path: dan_path,
+                    network_queues: self
+                        .hypervisor
+                        .hypervisor_config()
+                        .await
+                        .network_info
+                        .network_queues as usize,
                 },
             )))
         } else if let Some(netns_path) = network_env.netns.as_ref() {
@@ -352,7 +642,7 @@ impl VirtSandbox {
         Ok(())
     }
 
-    async fn prepare_rootfs_config(&self) -> Result<Option<BlockConfig>> {
+    async fn prepare_rootfs_config(&self) -> Result<Option<BlockConfigModern>> {
         let boot_info = self.hypervisor.hypervisor_config().await.boot_info;
         let security_info = self.hypervisor.hypervisor_config().await.security_info;
 
@@ -372,12 +662,46 @@ impl VirtSandbox {
             }
         }
 
-        Ok(Some(BlockConfig {
+        Ok(Some(BlockConfigModern {
             path_on_host: boot_info.image.clone(),
             is_readonly: true,
             driver_option: boot_info.vm_rootfs_driver,
             ..Default::default()
         }))
+    }
+
+    async fn prepare_guest_extension_images_config(&self) -> Result<Vec<BlockConfigModern>> {
+        let hv_config = self.hypervisor.hypervisor_config().await;
+        let mut configs = Vec::new();
+
+        // Extension images must be cold-plugged as virtio-blk, because the
+        // guest discovers each extension by its deterministic serial
+        // (extension-<name>), and only virtio-blk devices carry that serial.
+        // We therefore always enforce a virtio-blk transport here (the
+        // architecture's virtio-blk-ccw on s390x, virtio-blk-pci elsewhere)
+        // rather than reusing vm_rootfs_driver or block_device_driver: those
+        // may resolve to a non-virtio-blk transport such as virtio-pmem
+        // (NVDIMM, no serial) or virtio-scsi, which would leave the extension
+        // undiscoverable and its mount unit would fail closed.
+        let block_driver = if uses_native_ccw_bus() {
+            VIRTIO_BLK_CCW.to_string()
+        } else {
+            VIRTIO_BLK_PCI.to_string()
+        };
+        for extra in &hv_config.guest_extension_images {
+            if extra.path.is_empty() {
+                continue;
+            }
+            configs.push(BlockConfigModern {
+                path_on_host: extra.path.clone(),
+                is_readonly: true,
+                driver_option: block_driver.clone(),
+                serial_override: format!("extension-{}", extra.name),
+                ..Default::default()
+            });
+        }
+
+        Ok(configs)
     }
 
     async fn set_agent_policy(&self) -> Result<()> {
@@ -431,23 +755,14 @@ impl VirtSandbox {
         hypervisor_config: &HypervisorConfig,
         init_data: Option<String>,
     ) -> Result<Option<ProtectionDeviceConfig>> {
-        let available_protection = available_guest_protection()?;
-        // We need to cover the following case:
-        // - Required to run Kata containers in TEE environment
-        // E.g., available_guest_protection() returns Se, but confidential_guest is not set.
-        // Unless the configuration is skipped, the VM will fail to start
-        // due to lack of a secure boot image for IBM SEL
-        if available_protection != GuestProtection::NoProtection
-            && !hypervisor_config.security_info.confidential_guest
-        {
-            info!(
-                sl!(),
-                "confidential_guest is not set while {:?} protection is detected, \
-                 skipping protection device config",
-                available_protection
-            );
+        // No guest protection requested: skip host detection and run without
+        // a protection device (also avoids failing on hosts that advertise a
+        // protection they cannot use, e.g. SEV without SEV-SNP).
+        if !hypervisor_config.security_info.confidential_guest {
             return Ok(None);
         }
+
+        let available_protection = available_guest_protection()?;
         info!(
             sl!(),
             "sandbox: available protection: {:?}", available_protection
@@ -543,7 +858,7 @@ impl VirtSandbox {
             "initdata push data into compressed block: {:?}", &image_path
         );
         let block_driver = &hypervisor_config.blockdev_info.block_device_driver;
-        let block_config = BlockConfig {
+        let block_config = BlockConfigModern {
             path_on_host: image_path.display().to_string(),
             is_readonly: true,
             driver_option: block_driver.clone(),
@@ -563,6 +878,69 @@ impl VirtSandbox {
     ) -> bool {
         !prestart_hooks.is_empty() || !create_runtime_hooks.is_empty()
     }
+
+    /// Build a network rescan config targeting the hypervisor's network
+    /// namespace.  Docker 26+ bind-mounts `/proc/<vmm_pid>/ns/net` and
+    /// configures veth pairs there between Create and Start, so the
+    /// hypervisor netns is where the interfaces will appear — regardless
+    /// of whether we earlier created a placeholder netns (network_created)
+    /// or not.  This mirrors the Go shim's `detectHypervisorNetns` logic
+    /// inside `addAllEndpoints` (commit f7878cc).
+    async fn netns_rescan_config(&self) -> Option<NetworkWithNetNsConfig> {
+        let toml = self.resource_manager.config().await;
+        if toml.runtime.disable_new_netns {
+            return None;
+        }
+        if dan_config_path(&toml, &self.sid).exists() {
+            return None;
+        }
+        self.sandbox_config.as_ref()?;
+
+        let vmm_pid = match self.hypervisor.get_vmm_master_tid().await {
+            Ok(pid) => pid,
+            Err(e) => {
+                warn!(sl!(), "netns_rescan_config: cannot get VMM PID: {:?}", e);
+                return None;
+            }
+        };
+        let netns_path = format!("/proc/{}/ns/net", vmm_pid);
+
+        let queues = self
+            .hypervisor
+            .hypervisor_config()
+            .await
+            .network_info
+            .network_queues as usize;
+        Some(NetworkWithNetNsConfig {
+            network_model: toml.runtime.internetworking_model.clone(),
+            netns_path,
+            queues,
+            network_created: false,
+        })
+    }
+}
+
+/// Collect VFIO character device nodes (e.g. /dev/vfio/devices/vfio0) that a CDI
+/// runtime injected directly into the OCI spec for the Docker/nerdctl/podman
+/// flow, where there is no kubelet PodResources API to query. The legacy
+/// `/dev/vfio/vfio` control node is skipped as it is not a pass-through device.
+fn oci_spec_vfio_device_paths() -> Vec<String> {
+    let Ok(spec) = load_oci_spec() else {
+        return Vec::new();
+    };
+    let Some(linux) = spec.linux() else {
+        return Vec::new();
+    };
+    let Some(devices) = linux.devices() else {
+        return Vec::new();
+    };
+
+    devices
+        .iter()
+        .filter(|dev| dev.typ() == oci::LinuxDeviceType::C)
+        .map(|dev| dev.path().display().to_string())
+        .filter(|path| path.starts_with("/dev/vfio") && path != "/dev/vfio/vfio")
+        .collect()
 }
 
 #[async_trait]
@@ -602,9 +980,7 @@ impl Sandbox for VirtSandbox {
 
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
-        let resources = self
-            .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
-            .await?;
+        let resources = self.prepare_for_start_sandbox(id, sandbox_config).await?;
 
         self.resource_manager
             .prepare_before_start_vm(resources)
@@ -614,6 +990,22 @@ impl Sandbox for VirtSandbox {
         // start vm
         self.hypervisor.start_vm(10_000).await.context("start vm")?;
         info!(sl!(), "start vm");
+
+        let sandbox = self.clone();
+        // wait for vm exit in background, and record the exit status and time when vm exited.
+        tokio::spawn(async move {
+            match sandbox.hypervisor.wait_vm().await {
+                Ok(exit_code) => {
+                    sandbox
+                        .record_stop(exit_code as u32, SystemTime::now())
+                        .await;
+                }
+                Err(err) => {
+                    warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
+                    sandbox.record_stop(255, SystemTime::now()).await;
+                }
+            }
+        });
 
         // execute pre-start hook functions, including Prestart Hooks and CreateRuntime Hooks
         let (prestart_hooks, create_runtime_hooks) =
@@ -707,6 +1099,7 @@ impl Sandbox for VirtSandbox {
             .context("create sandbox")?;
 
         inner.state = SandboxState::Running;
+        inner.created_at = Some(std::time::SystemTime::now());
 
         // get and store guest details
         self.store_guest_details()
@@ -715,39 +1108,54 @@ impl Sandbox for VirtSandbox {
 
         let agent = self.agent.clone();
         let sender = self.msg_sender.clone();
+        let cancel_token = self.cancel_token.clone();
+
         info!(sl!(), "oom watcher start");
         tokio::spawn(async move {
             loop {
-                match agent
-                    .get_oom_event(agent::Empty::new())
-                    .await
-                    .context("get oom event")
-                {
-                    Ok(resp) => {
-                        let cid = &resp.container_id;
-                        warn!(sl!(), "send oom event for container {}", &cid);
-                        let event = TaskOOM {
-                            container_id: cid.to_string(),
-                            ..Default::default()
-                        };
-                        let msg = Message::new(Action::Event(Arc::new(event)));
-                        let lock_sender = sender.lock().await;
-                        if let Err(err) = lock_sender.send(msg).await.context("send event") {
-                            error!(
-                                sl!(),
-                                "failed to send oom event for {} error {:?}", cid, err
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        warn!(sl!(), "failed to get oom event error {:?}", err);
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        // Sandbox or VM is shutting down, gracefully exit watcher
+                        info!(sl!(), "oom watcher cancelled, sandbox is stopping");
                         break;
+                    }
+                    res = agent.get_oom_event(agent::Empty::new()) => {
+                        match res.context("get oom event") {
+                            Ok(resp) => {
+                                let cid = &resp.container_id;
+                                warn!(sl!(), "send oom event for container {}", &cid);
+                                let event = TaskOOM {
+                                    container_id: cid.to_string(),
+                                    ..Default::default()
+                                };
+                                let msg = Message::new(Action::Event(Arc::new(event)));
+                                let lock_sender = sender.lock().await;
+                                if let Err(err) = lock_sender.send(msg).await.context("send event") {
+                                    error!(
+                                        sl!(),
+                                        "failed to send oom event for {} error {:?}", cid, err
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                // Handle errors by type
+                                if is_normal_oom_shutdown_error(&err) {
+                                    info!(sl!(), "oom watcher exit on sandbox shutdown: {:?}", err);
+                                    break;
+                                } else {
+                                    warn!(sl!(), "failed to get oom event error {:?}", err);
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
+
         self.monitor.start(id, self.agent.clone());
         self.save().await.context("save state")?;
+
         Ok(())
     }
 
@@ -786,7 +1194,7 @@ impl Sandbox for VirtSandbox {
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
         let resources = self
-            .prepare_for_start_sandbox(id, sandbox_config.network_env.clone())
+            .prepare_for_start_sandbox(id, sandbox_config)
             .await
             .context("prepare resources before start vm")?;
 
@@ -800,40 +1208,84 @@ impl Sandbox for VirtSandbox {
             .await
             .context("start template vm")?;
         info!(sl!(), "vm started from template");
+
+        let sandbox = self.clone();
+        tokio::spawn(async move {
+            match sandbox.hypervisor.wait_vm().await {
+                Ok(exit_code) => {
+                    sandbox
+                        .record_stop(exit_code as u32, SystemTime::now())
+                        .await;
+                }
+                Err(err) => {
+                    warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
+                    sandbox.record_stop(255, SystemTime::now()).await;
+                }
+            }
+        });
+
         Ok(())
     }
 
     async fn status(&self) -> Result<SandboxStatus> {
-        info!(sl!(), "get sandbox status");
         let inner = self.inner.read().await;
-        let state = inner.state.to_string();
+        let state = inner.state.to_cri_state().to_string();
 
         Ok(SandboxStatus {
             sandbox_id: self.sid.clone(),
             pid: std::process::id(),
             state,
-            ..Default::default()
+            info: std::collections::HashMap::new(),
+            created_at: inner.created_at,
         })
     }
 
     async fn wait(&self) -> Result<SandboxExitInfo> {
         info!(sl!(), "wait sandbox");
-        let exit_code = self.hypervisor.wait_vm().await.context("wait vm")?;
-        Ok(SandboxExitInfo {
-            exit_status: exit_code as u32,
-            exited_at: Some(std::time::SystemTime::now()),
-        })
+        {
+            let inner = self.inner.read().await;
+            if inner.state == SandboxState::Stopped {
+                return Ok(inner.exit_info.clone().unwrap_or_default());
+            }
+        }
+
+        let mut exit_notify_rx = self.exit_notify_tx.subscribe();
+        while !*exit_notify_rx.borrow() {
+            exit_notify_rx
+                .changed()
+                .await
+                .context("wait for sandbox stop notification")?;
+        }
+
+        let inner = self.inner.read().await;
+        Ok(inner.exit_info.clone().unwrap_or_default())
     }
 
     async fn stop(&self) -> Result<()> {
-        let mut sandbox_inner = self.inner.write().await;
+        let state = {
+            let sandbox_inner = self.inner.read().await;
+            sandbox_inner.state
+        };
 
-        if sandbox_inner.state != SandboxState::Stopped {
-            info!(sl!(), "begin stop sandbox");
-            self.hypervisor.stop_vm().await.context("stop vm")?;
-            sandbox_inner.state = SandboxState::Stopped;
-            info!(sl!(), "sandbox stopped");
+        if state == SandboxState::Stopped {
+            return Ok(());
         }
+
+        // Cancel the OOM watcher before tearing down the VM so it exits
+        // cleanly instead of hitting ECONNRESET/EOF on a closed channel.
+        self.cancel_token.cancel();
+
+        info!(sl!(), "begin stop sandbox");
+        if state == SandboxState::Init {
+            let _ = self.hypervisor.stop_vm().await;
+            self.record_stop(0, SystemTime::now()).await;
+            info!(sl!(), "sandbox stopped during Init");
+            return Ok(());
+        }
+
+        self.hypervisor.stop_vm().await.context("stop vm")?;
+        self.wait().await.context("wait for vm exit after stop")?;
+        info!(sl!(), "sandbox stopped");
 
         Ok(())
     }
@@ -861,6 +1313,16 @@ impl Sandbox for VirtSandbox {
     }
 
     async fn cleanup(&self) -> Result<()> {
+        // Teardown may be triggered both when the sandbox container exits and
+        // by a later shutdown RPC; only release the resources once.
+        {
+            let mut inner = self.inner.write().await;
+            if inner.cleaned {
+                return Ok(());
+            }
+            inner.cleaned = true;
+        }
+
         info!(sl!(), "delete hypervisor");
         self.hypervisor
             .cleanup()
@@ -874,6 +1336,20 @@ impl Sandbox for VirtSandbox {
             .context("resource clean up")?;
 
         // TODO: cleanup other sandbox resource
+        Ok(())
+    }
+
+    async fn rescan_network(&self) -> Result<()> {
+        if let Some(net_cfg) = self.netns_rescan_config().await {
+            info!(
+                sl!(),
+                "rescan_network: scanning netns={}", net_cfg.netns_path
+            );
+            self.resource_manager
+                .rescan_network_if_unconfigured(net_cfg)
+                .await
+                .context("network rescan during start")?;
+        }
         Ok(())
     }
 
@@ -1004,10 +1480,17 @@ impl Persist for VirtSandbox {
             sandbox_type: VIRTCONTAINER.to_string(),
             resource: Some(self.resource_manager.save().await?),
             hypervisor: match hypervisor_state.hypervisor_type.as_str() {
-                // TODO support other hypervisors
-                #[cfg(feature = "dragonball")]
+                #[cfg(all(
+                    feature = "dragonball",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
                 HYPERVISOR_DRAGONBALL => Ok(Some(hypervisor_state)),
+                #[cfg(all(
+                    feature = "cloud-hypervisor",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
                 HYPERVISOR_NAME_CH => Ok(Some(hypervisor_state)),
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 HYPERVISOR_FIRECRACKER => Ok(Some(hypervisor_state)),
                 HYPERVISOR_QEMU => Ok(Some(hypervisor_state)),
                 HYPERVISOR_REMOTE => Ok(Some(hypervisor_state)),
@@ -1042,14 +1525,35 @@ impl Persist for VirtSandbox {
         let r = sandbox_state.resource.unwrap_or_default();
         let h = sandbox_state.hypervisor.unwrap_or_default();
         let hypervisor = match h.hypervisor_type.as_str() {
-            // TODO support other hypervisors
-            #[cfg(feature = "dragonball")]
+            #[cfg(all(
+                feature = "dragonball",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             HYPERVISOR_DRAGONBALL => {
                 let hypervisor = Arc::new(Dragonball::restore((), h).await?) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
+            #[cfg(all(
+                feature = "cloud-hypervisor",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            HYPERVISOR_NAME_CH => {
+                let hypervisor =
+                    Arc::new(CloudHypervisor::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            HYPERVISOR_FIRECRACKER => {
+                let hypervisor =
+                    Arc::new(Firecracker::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
             HYPERVISOR_QEMU => {
                 let hypervisor = Arc::new(Qemu::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
+            HYPERVISOR_REMOTE => {
+                let hypervisor = Arc::new(Remote::restore((), h).await?) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
             _ => Err(anyhow!("Unsupported hypervisor {}", &h.hypervisor_type)),
@@ -1072,9 +1576,11 @@ impl Persist for VirtSandbox {
             hypervisor,
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
+            exit_notify_tx: watch::channel(false).0,
             sandbox_config: None,
             shm_size: DEFAULT_SHM_SIZE,
             factory: None,
+            cancel_token: CancellationToken::default(),
         })
     }
 }

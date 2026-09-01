@@ -15,9 +15,9 @@ fn parse_toml_path(path: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = path.chars().peekable();
+    let chars = path.chars().peekable();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         match ch {
             '"' => {
                 in_quotes = !in_quotes;
@@ -67,11 +67,7 @@ fn split_non_toml_header(content: &str) -> (&str, &str) {
 /// Ensures the header ends with a newline before the TOML body.
 /// Trims leading newlines from the serialized document to avoid many blank lines
 /// when the file was initially empty (e.g. containerd drop-in).
-fn write_toml_with_header(
-    file_path: &Path,
-    header: &str,
-    doc: &DocumentMut,
-) -> Result<()> {
+fn write_toml_with_header(file_path: &Path, header: &str, doc: &DocumentMut) -> Result<()> {
     let normalized_header = if header.is_empty() {
         String::new()
     } else if header.ends_with('\n') {
@@ -117,6 +113,47 @@ pub fn set_toml_value(file_path: &Path, path: &str, value: &str) -> Result<()> {
                 .get_mut(part.as_str())
                 .and_then(|item| item.as_table_mut())
                 .ok_or_else(|| anyhow::anyhow!("Path component '{part}' is not a table"))?;
+        }
+    }
+
+    write_toml_with_header(file_path, header, &doc)?;
+
+    Ok(())
+}
+
+/// Delete a TOML value (or table) at a given path.
+///
+/// Navigates to the parent table and removes the final key. This is a no-op if
+/// any path component (including the final key) does not exist, so callers can
+/// unconditionally remove a value that may or may not be present.
+pub fn delete_toml_value(file_path: &Path, path: &str) -> Result<()> {
+    let content = std::fs::read_to_string(file_path)
+        .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
+
+    let (header, toml_content) = split_non_toml_header(&content);
+    let mut doc = toml_content
+        .parse::<DocumentMut>()
+        .context("Failed to parse TOML")?;
+
+    let parts = parse_toml_path(path)?;
+
+    let mut current_table = doc.as_table_mut();
+    for (i, part) in parts.iter().enumerate() {
+        let is_last = i == parts.len() - 1;
+
+        if is_last {
+            // Remove the value; absent key is fine (no-op).
+            current_table.remove(part.as_str());
+        } else {
+            // Navigate into the intermediate table. If it does not exist, there
+            // is nothing to delete.
+            match current_table
+                .get_mut(part.as_str())
+                .and_then(|item| item.as_table_mut())
+            {
+                Some(table) => current_table = table,
+                None => return Ok(()),
+            }
         }
     }
 
@@ -214,7 +251,10 @@ pub fn append_to_toml_array(file_path: &Path, path: &str, value: &str) -> Result
             // This is the array itself - use .get() to avoid panic on missing key
             let key_exists = current.get(part.as_str()).is_some();
             if !key_exists {
-                current.insert(part.as_str(), Item::Value(Value::Array(toml_edit::Array::new())));
+                current.insert(
+                    part.as_str(),
+                    Item::Value(Value::Array(toml_edit::Array::new())),
+                );
             }
             if let Some(Item::Value(Value::Array(arr))) = current.get_mut(part.as_str()) {
                 let value_item = parse_toml_value(value);
@@ -441,11 +481,7 @@ mod tests {
     #[case("", "", "")]
     #[case("key = \"value\"\n", "", "key = \"value\"\n")]
     #[case("[plugins]\nfoo = 1\n", "", "[plugins]\nfoo = 1\n")]
-    #[case(
-        "{{ template \"base\" . }}\n",
-        "{{ template \"base\" . }}\n",
-        ""
-    )]
+    #[case("{{ template \"base\" . }}\n", "{{ template \"base\" . }}\n", "")]
     #[case(
         "{{ template \"base\" . }}\n[plugins]\nfoo = 1\n",
         "{{ template \"base\" . }}\n",
@@ -464,7 +500,11 @@ mod tests {
         #[case] expected_toml: &str,
     ) {
         let (header, toml) = split_non_toml_header(input);
-        assert_eq!(header, expected_header, "header mismatch for input: {:?}", input);
+        assert_eq!(
+            header, expected_header,
+            "header mismatch for input: {:?}",
+            input
+        );
         assert_eq!(toml, expected_toml, "toml mismatch for input: {:?}", input);
     }
 
@@ -484,7 +524,10 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.starts_with("{{ template \"base\" . }}\n"), "header must be preserved");
+        assert!(
+            content.starts_with("{{ template \"base\" . }}\n"),
+            "header must be preserved"
+        );
         assert!(content.contains("runtime_type"), "value must be written");
 
         let value = get_toml_value(
@@ -580,8 +623,12 @@ mod tests {
                 &format!("\"io.containerd.{shim}.v2\""),
             )
             .unwrap();
-            set_toml_value(path, &format!("{table}.privileged_without_host_devices"), "true")
-                .unwrap();
+            set_toml_value(
+                path,
+                &format!("{table}.privileged_without_host_devices"),
+                "true",
+            )
+            .unwrap();
         }
 
         let content = std::fs::read_to_string(path).unwrap();
@@ -633,7 +680,10 @@ mod tests {
         )
         .unwrap();
         let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.starts_with(expected_prefix), "header/prefix must be preserved");
+        assert!(
+            content.starts_with(expected_prefix),
+            "header/prefix must be preserved"
+        );
         let body_start = content.strip_prefix(expected_prefix).unwrap();
         assert!(
             !body_start.starts_with('\n'),
@@ -782,11 +832,7 @@ mod tests {
     #[case("test.string_value", "test_string", "test_string")]
     #[case("test.bool_value", "true", "true")]
     #[case("test.int_value", "42", "42")]
-    fn test_toml_value_types(
-        #[case] path: &str,
-        #[case] value: &str,
-        #[case] expected: &str,
-    ) {
+    fn test_toml_value_types(#[case] path: &str, #[case] value: &str, #[case] expected: &str) {
         let file = NamedTempFile::new().unwrap();
         let file_path = file.path();
         std::fs::write(file_path, "").unwrap();
@@ -827,8 +873,8 @@ mod tests {
                 );
 
                 // Test modifying kernel_params on real config
-                let current = get_toml_value(temp_path, "hypervisor.qemu.kernel_params")
-                    .unwrap_or_default();
+                let current =
+                    get_toml_value(temp_path, "hypervisor.qemu.kernel_params").unwrap_or_default();
                 let new_value = format!("{} agent.log=debug", current.trim_matches('"'));
                 let result = set_toml_value(
                     temp_path,
@@ -948,14 +994,14 @@ kernel_params = "console=hvc0"
     }
 
     #[test]
-    fn test_runtime_rs_cloud_hypervisor_config() {
-        // Test with actual cloud-hypervisor config from runtime-rs
+    fn test_runtime_rs_clh_config() {
+        // Test with actual clh config from runtime-rs
         let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
-            .map(|p| p.join("src/runtime-rs/config/configuration-cloud-hypervisor.toml.in"));
+            .map(|p| p.join("src/runtime-rs/config/configuration-clh-runtime-rs.toml.in"));
 
         if let Some(ref path) = config_path {
             if path.exists() {
@@ -991,7 +1037,7 @@ kernel_params = "console=hvc0"
                     .replace("@DEFVIRTIOFSEXTRAARGS@", "[]")
                     .replace("@DEFVIRTIOFSDAEMON@", "virtiofsd")
                     .replace("@DEFSHAREDFS_CLH_VIRTIOFS@", "virtio-fs")
-                    .replace("@HYPERVISOR_CLH@", "cloud-hypervisor")
+                    .replace("@HYPERVISOR_NAME_CLH@", "clh")
                     .replace("@PROJECT_NAME@", "kata-containers")
                     .replace("@PROJECT_TYPE@", "kata")
                     .replace("@RUNTIMENAME@", "kata-runtime")
@@ -1013,24 +1059,19 @@ kernel_params = "console=hvc0"
                 let temp_path = temp_file.path();
                 std::fs::write(temp_path, content).unwrap();
 
-                // Verify cloud-hypervisor specific fields exist
-                let vm_rootfs =
-                    get_toml_value(temp_path, "hypervisor.cloud-hypervisor.vm_rootfs_driver");
+                // Verify clh-specific fields exist
+                let vm_rootfs = get_toml_value(temp_path, "hypervisor.clh.vm_rootfs_driver");
                 assert!(
                     vm_rootfs.is_ok(),
                     "Should have vm_rootfs_driver field: {:?}",
                     vm_rootfs.err()
                 );
 
-                // Test modifying cloud-hypervisor config
-                let result = set_toml_value(
-                    temp_path,
-                    "hypervisor.cloud-hypervisor.enable_debug",
-                    "true",
-                );
+                // Test modifying clh config
+                let result = set_toml_value(temp_path, "hypervisor.clh.enable_debug", "true");
                 assert!(
                     result.is_ok(),
-                    "Should be able to set enable_debug on cloud-hypervisor config"
+                    "Should be able to set enable_debug on clh config"
                 );
             }
         }
@@ -1137,7 +1178,7 @@ kernel_params = "console=hvc0"
             let go_config = base.join("src/runtime/config/configuration-qemu.toml.in");
             // Rust runtime config
             let rust_config =
-                base.join("src/runtime-rs/config/configuration-cloud-hypervisor.toml.in");
+                base.join("src/runtime-rs/config/configuration-clh-runtime-rs.toml.in");
 
             if go_config.exists() && rust_config.exists() {
                 // Create temp copies
@@ -1182,8 +1223,6 @@ kernel_params = "console=hvc0"
                     .replace("@DEFENABLEIOTHREADS@", "false")
                     .replace("@DEFENABLEVHOSTUSERSTORE@", "false")
                     .replace("@DEFENTROPYSOURCE@", "/dev/urandom")
-                    .replace("@DEFFILEMEMBACKEND@", "")
-                    .replace("@DEFVALIDFILEMEMBACKENDS@", "[]")
                     .replace("@DEFBLOCKSTORAGEDRIVER_QEMU@", "virtio-blk")
                     .replace("@DEFBLOCKDEVICEAIO_QEMU@", "io_uring")
                     .replace("@DEFAULTEXPFEATURES@", "[]")
@@ -1318,7 +1357,11 @@ kernel_params = "console=hvc0"
             "set" => set_toml_value(temp_path, "some.path", "\"value\""),
             _ => panic!("unknown op"),
         };
-        assert!(result.is_err(), "Should fail parsing invalid TOML (op={})", op);
+        assert!(
+            result.is_err(),
+            "Should fail parsing invalid TOML (op={})",
+            op
+        );
     }
 
     #[test]
@@ -1711,5 +1754,101 @@ imports = ["/etc/containerd/conf.d/*.toml", "/opt/kata/containerd/config.d/kata-
         )
         .unwrap();
         assert_eq!(runtime_type, "io.containerd.kata-qemu.v2");
+    }
+
+    #[test]
+    fn test_delete_toml_value() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+        std::fs::write(
+            temp_path,
+            "[plugins.\"io.containerd.snapshotter.v1.erofs\"]\nmax_unmerged_layers = 0\nenable_fsverity = true\n",
+        )
+        .unwrap();
+
+        // Sanity check: value is present before deletion.
+        let before = get_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".max_unmerged_layers",
+        )
+        .unwrap();
+        assert_eq!(before, "0");
+
+        delete_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".max_unmerged_layers",
+        )
+        .unwrap();
+
+        // The deleted key is gone, but sibling keys remain.
+        let result = get_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".max_unmerged_layers",
+        );
+        assert!(result.is_err(), "deleted key should no longer be found");
+
+        let sibling = get_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".enable_fsverity",
+        )
+        .unwrap();
+        assert_eq!(sibling, "true", "sibling keys must be preserved");
+    }
+
+    #[test]
+    fn test_delete_toml_value_missing_key_is_noop() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+        let initial = "[plugins.\"io.containerd.snapshotter.v1.erofs\"]\nenable_fsverity = true\n";
+        std::fs::write(temp_path, initial).unwrap();
+
+        // Deleting a key that does not exist must succeed and leave the file usable.
+        delete_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".max_unmerged_layers",
+        )
+        .unwrap();
+
+        // Deleting through a non-existent intermediate table is also a no-op.
+        delete_toml_value(temp_path, ".plugins.\"nonexistent.plugin\".some_key").unwrap();
+        let sibling = get_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".enable_fsverity",
+        )
+        .unwrap();
+        assert_eq!(sibling, "true");
+    }
+
+    #[test]
+    fn test_delete_toml_value_preserves_k3s_header() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let temp_path = temp_file.path();
+        std::fs::write(
+            temp_path,
+            "{{ template \"base\" . }}\n[plugins.\"io.containerd.snapshotter.v1.erofs\"]\nmax_unmerged_layers = 0\n",
+        )
+        .unwrap();
+
+        delete_toml_value(
+            temp_path,
+            ".plugins.\"io.containerd.snapshotter.v1.erofs\".max_unmerged_layers",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(temp_path).unwrap();
+        assert!(
+            content.starts_with("{{ template \"base\" . }}\n"),
+            "non-TOML header must be preserved"
+        );
+        assert!(
+            !content.contains("max_unmerged_layers"),
+            "value must be removed"
+        );
+    }
+
+    #[test]
+    fn test_delete_toml_value_nonexistent_file() {
+        let result = delete_toml_value(Path::new("/nonexistent/file.toml"), "some.path");
+        assert!(result.is_err());
     }
 }

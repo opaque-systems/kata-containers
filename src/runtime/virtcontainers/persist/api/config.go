@@ -70,9 +70,6 @@ type HypervisorConfig struct {
 	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
-
 	// VhostUserStorePath is the directory path where vhost-user devices
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
@@ -101,9 +98,6 @@ type HypervisorConfig struct {
 
 	// VirtioFSExtraArgs passes options to virtiofsd daemon
 	VirtioFSExtraArgs []string
-
-	// FileBackedMemRootList is the list of valid root directories values for annotations
-	FileBackedMemRootList []string
 
 	// VhostUserStorePathList is the list of valid values for vhost-user paths
 	VhostUserStorePathList []string
@@ -156,6 +150,14 @@ type HypervisorConfig struct {
 	// BlockDeviceCacheNoflush specifies cache-related options for block devices.
 	// Denotes whether flush requests for the device are ignored.
 	BlockDeviceCacheNoflush bool
+
+	// BlockDeviceLogicalSectorSize specifies the logical sector size reported
+	// by block devices to the guest, in bytes.
+	BlockDeviceLogicalSectorSize uint32
+
+	// BlockDevicePhysicalSectorSize specifies the physical sector size reported
+	// by block devices to the guest, in bytes.
+	BlockDevicePhysicalSectorSize uint32
 
 	// DisableBlockDeviceUse disallows a block device from being used.
 	DisableBlockDeviceUse bool

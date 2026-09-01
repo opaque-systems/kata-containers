@@ -10,7 +10,7 @@ load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
 export KBS="${KBS:-false}"
 export test_key="aatest"
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 export RUNTIME_CLASS_NAME="kata-${KATA_HYPERVISOR}"
 export AA_KBC="${AA_KBC:-cc_kbc}"
 
@@ -80,16 +80,23 @@ setup() {
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout="$timeout" pod "${pod_name}"
 
-	# Wait 5s for connecting with remote KBS
-	sleep 5
+	# pod-attestable-gpu becomes Ready once curl is installed; CDH fetch and GPU
+	# attestation (e.g. remote NRAS) run afterward and routinely exceed a short
+	# fixed sleep. Poll logs until the resource appears (or timeout).
+	if is_confidential_gpu_hardware; then
+		waitForProcess "180" "5" "kubectl logs ${pod_name} 2>/dev/null | grep -q \"${test_key}\""
+		waitForProcess "120" "5" "kubectl logs ${pod_name} 2>/dev/null | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
+	else
+		sleep 5
+	fi
 
-	kubectl logs aa-test-cc
-	cmd="kubectl logs aa-test-cc | grep -q ${test_key}"
+	kubectl logs "${pod_name}"
+	cmd="kubectl logs ${pod_name} | grep -q ${test_key}"
 	run bash -c "$cmd"
 	[ "$status" -eq 0 ]
 
 	if is_confidential_gpu_hardware; then
-		cmd="kubectl logs aa-test-cc | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
+		cmd="kubectl logs ${pod_name} | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
 		run bash -c "$cmd"
 		[ "$status" -eq 0 ]
 	fi
@@ -117,8 +124,17 @@ setup() {
 # (the AS policy must return an affirming trust vector), but no
 # reference values are set.
 #
-# This can run on all platforms.
+# Skipped on IBM SEL / qemu-se* because that environment returns an
+# affirming trust vector when verification completes successfully, even
+# without reference values.
 @test "Cannot get CDH resource when affirming policy is set without reference values" {
+
+	if [[ "${KATA_HYPERVISOR}" == qemu-se* ]]; then
+		local skip_reason="IBM SEL returns an affirming trust vector if the verification process "
+		skip_reason+="completes successfully, even if no reference values are set. See "
+		skip_reason+="https://github.com/confidential-containers/trustee/blob/d4e317620c4039c89779b725f74974d8f005da66/attestation-service/src/ear_token/ear_default_policy_cpu.rego#L323-L339"
+		skip "${skip_reason}"
+	fi
 
 	# Require CPU0 to have affirming trust level.
 	kbs_set_cpu0_resource_policy
@@ -146,15 +162,22 @@ setup() {
 	kbs_set_cpu0_resource_policy
 
 	# get measured artifacts from qemu command line of previous test
+	# Go runtime logs: "launching <path> with: [<args>]"
+	# runtime-rs logs: "qemu args: <args>"
 	log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'launching.*qemu.*with:' || true)
-	qemu_cmd=$(echo "$log_line" | sed 's/.*with: \[\(.*\)\]".*/\1/')
+	if [[ -n "$log_line" ]]; then
+		qemu_cmd=$(echo "$log_line" | sed 's/.*with: \[\(.*\)\]".*/\1/')
+	else
+		log_line=$(sudo journalctl -r -x -t kata | grep -m 1 'qemu args:' || true)
+		qemu_cmd=$(echo "$log_line" | sed 's/.*qemu args: //')
+	fi
 	[[ -n "$qemu_cmd" ]] || { echo "Could not find QEMU command line"; return 1; }
 
 	kernel_path=$(echo "$qemu_cmd" | grep -oP -- '-kernel \K[^ ]+')
 	initrd_path=$(echo "$qemu_cmd" | grep -oP -- '-initrd \K[^ ]+' || true)
 	firmware_path=$(echo "$qemu_cmd" | grep -oP -- '-bios \K[^ ]+')
 	vcpu_count=$(echo "$qemu_cmd" | grep -oP -- '-smp \K\d+')
-	append=$(echo "$qemu_cmd" | sed -n 's/.*-append \(.*\) -bios.*/\1/p')
+	append=$(echo "$qemu_cmd" | grep -oP -- '-append \K.*?(?= -(smp|bios) )')
 	# Remove escape backslashes for quotes from output for dm-mod.create parameters
 	append="${append//\\\"/\"}"
 

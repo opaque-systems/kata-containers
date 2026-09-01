@@ -22,7 +22,8 @@ use hypervisor::device::device_manager::DeviceManager;
 use inotify::{EventMask, Inotify, WatchMask};
 use kata_sys_util::mount::{get_mount_options, get_mount_path, get_mount_type};
 use nix::sys::stat::SFlag;
-use rand::{thread_rng, RngCore};
+use rand::rng;
+use rand::Rng;
 use tokio::{
     io::AsyncReadExt,
     sync::{Mutex, RwLock},
@@ -845,7 +846,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                     uid: metadata.uid() as i32,
                     gid: metadata.gid() as i32,
                     dir_mode: metadata.mode(),
-                    file_mode: SFlag::S_IFDIR.bits(),
+                    file_mode: metadata.mode(),
                     data: vec![],
                     ..Default::default()
                 };
@@ -878,7 +879,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                     file_size: metadata.len() as i64,
                     uid: metadata.uid() as i32,
                     gid: metadata.gid() as i32,
-                    file_mode: SFlag::S_IFREG.bits(),
+                    file_mode: metadata.mode(),
                     data: buffer,
                     ..Default::default()
                 };
@@ -968,7 +969,7 @@ pub(crate) fn is_watchable_volume(source_path: &PathBuf) -> bool {
 /// Generates a guest path related to mount dest
 fn generate_guest_path(cid: &str, mount_destination: &Path) -> Result<String> {
     let mut data = vec![0u8; 8];
-    let mut rng = thread_rng(); // Get a thread-local RNG
+    let mut rng = rng(); // Get a thread-local RNG
     rng.fill_bytes(&mut data);
 
     let hex_str = hex::encode(data);

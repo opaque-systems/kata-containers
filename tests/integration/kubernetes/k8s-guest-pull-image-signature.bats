@@ -21,17 +21,14 @@ setup() {
         skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
     fi
 
-    tag_suffix=""
-    if [ "$(uname -m)" != "x86_64" ]; then
-        tag_suffix="-$(uname -m)"
-    fi
-
     setup_common || die "setup_common failed"
     UNSIGNED_UNPROTECTED_REGISTRY_IMAGE="quay.io/prometheus/busybox:latest"
-    UNSIGNED_PROTECTED_REGISTRY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:unsigned${tag_suffix}"
-    COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:cosign-signed${tag_suffix}"
-    COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:cosign-signed-key2${tag_suffix}"
+    UNSIGNED_PROTECTED_REGISTRY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:unsigned"
+    COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:cosign-signed"
+    COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE="ghcr.io/confidential-containers/test-container-image-rs:cosign-signed-key2"
+    test_image_supplemental_groups="10"
     SECURITY_POLICY_KBS_URI="kbs:///default/security-policy/test"
+    policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
 }
 
 function setup_kbs_image_policy() {
@@ -66,9 +63,8 @@ function setup_kbs_image_policy() {
 EOF
     )
 
-    # This public key is corresponding to a private key that was generated to test signed images in image-rs CI.
     # TODO: Update the CI to generate a signed image together with verification. See issue #9360
-    public_key=$(curl -sSL "https://raw.githubusercontent.com/confidential-containers/guest-components/075b9a9ee77227d9d92b6f3649ef69de5e72d204/image-rs/test_data/signature/cosign/cosign1.pub")
+    public_key=$(curl -sSL "https://raw.githubusercontent.com/confidential-containers/infra/main/container-images/keys/sign/cosign.pub")
 
     if ! is_confidential_hardware; then
         kbs_set_allow_all_resources
@@ -93,7 +89,9 @@ EOF
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
-    create_coco_pod_yaml "${UNSIGNED_UNPROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node"
+    create_coco_pod_yaml "${UNSIGNED_UNPROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -106,7 +104,9 @@ EOF
     # We want to leave the default policy to be insecureAcceptAnything to rule out false negatives
     setup_kbs_image_policy
 
-    create_coco_pod_yaml "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node"
+    create_coco_pod_yaml "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -119,7 +119,9 @@ EOF
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
-    create_coco_pod_yaml "${COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node"
+    create_coco_pod_yaml "${COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -132,7 +134,9 @@ EOF
     # We want to leave the default policy to be insecureAcceptAnything to rule out false negatives
     setup_kbs_image_policy
 
-    create_coco_pod_yaml "${COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node"
+    create_coco_pod_yaml "${COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE}" "${SECURITY_POLICY_KBS_URI}" "" "" "resource" "$node" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -145,7 +149,9 @@ EOF
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
-    create_coco_pod_yaml "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "" "" "resource" "$node"
+    create_coco_pod_yaml "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "" "" "resource" "$node" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -156,13 +162,14 @@ EOF
 
 @test "Create a pod from an unsigned image, on an insecureAcceptAnything registry works (with initdata)" {
 
-    [[ "${KATA_HYPERVISOR}" == "qemu-tdx" ]] && skip "https://github.com/kata-containers/kata-containers/issues/11945"
 
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
     initdata=$(get_initdata_with_security_policy)
-    create_coco_pod_yaml_with_annotations "${UNSIGNED_UNPROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}"
+    create_coco_pod_yaml_with_annotations "${UNSIGNED_UNPROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -173,13 +180,14 @@ EOF
 
 @test "Create a pod from an unsigned image, on a 'restricted registry' is rejected (with initdata)" {
 
-    [[ "${KATA_HYPERVISOR}" == "qemu-tdx" ]] && skip "https://github.com/kata-containers/kata-containers/issues/11945"
 
     # We want to leave the default policy to be insecureAcceptAnything to rule out false negatives
     setup_kbs_image_policy
 
     initdata=$(get_initdata_with_security_policy)
-    create_coco_pod_yaml_with_annotations "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}"
+    create_coco_pod_yaml_with_annotations "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -190,13 +198,14 @@ EOF
 
 @test "Create a pod from a signed image, on a 'restricted registry' is successful (with initdata)" {
 
-    [[ "${KATA_HYPERVISOR}" == "qemu-tdx" ]] && skip "https://github.com/kata-containers/kata-containers/issues/11945"
 
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
     initdata=$(get_initdata_with_security_policy)
-    create_coco_pod_yaml_with_annotations "${COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}"
+    create_coco_pod_yaml_with_annotations "${COSIGN_SIGNED_PROTECTED_REGISTRY_IMAGE}" "" "${initdata}" "${node}" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -207,13 +216,14 @@ EOF
 
 @test "Create a pod from a signed image, on a 'restricted registry', but with the wrong key is rejected (with initdata)" {
 
-    [[ "${KATA_HYPERVISOR}" == "qemu-tdx" ]] && skip "https://github.com/kata-containers/kata-containers/issues/11945"
 
     # We want to leave the default policy to be insecureAcceptAnything to rule out false negatives
     setup_kbs_image_policy
 
     initdata=$(get_initdata_with_security_policy)
-    create_coco_pod_yaml_with_annotations "${COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE}" "" "${initdata}" "${node}"
+    create_coco_pod_yaml_with_annotations "${COSIGNED_SIGNED_PROTECTED_REGISTRY_WRONG_KEY_IMAGE}" "" "${initdata}" "${node}" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -224,12 +234,13 @@ EOF
 
 @test "Create a pod from an unsigned image, on a 'restricted registry' works if policy files isn't set (with initdata)" {
 
-    [[ "${KATA_HYPERVISOR}" == "qemu-tdx" ]] && skip "https://github.com/kata-containers/kata-containers/issues/11945"
 
     # We want to set the default policy to be reject to rule out false positives
     setup_kbs_image_policy "reject"
 
-    create_coco_pod_yaml_with_annotations "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "" "${node}"
+    create_coco_pod_yaml_with_annotations "${UNSIGNED_PROTECTED_REGISTRY_IMAGE}" "" "" "${node}" \
+        "" "" "${test_image_supplemental_groups}"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod}"
 
     # For debug sake
     echo "Pod ${kata_pod}: $(cat ${kata_pod})"
@@ -247,5 +258,6 @@ teardown() {
         skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
     fi
 
+    delete_tmp_policy_settings_dir "${policy_settings_dir:-}"
     teardown_common "${node}" "${node_start_time:-}"
 }

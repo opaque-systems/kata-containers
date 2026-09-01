@@ -392,7 +392,7 @@ impl MemoryRegionFactory {
     fn configure_anon_mem(&self, mmap_reg: &MmapRegion) -> Result<(), VirtioError> {
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_DONTFORK,
             )
@@ -440,7 +440,7 @@ impl MemoryRegionFactory {
         // Safe because we just create the MmapRegion
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_HUGEPAGE,
             )
@@ -557,15 +557,14 @@ impl MemRegionFactory for MemoryRegionFactory {
         );
 
         // All value should be valid.
-        let memory_region = Arc::new(
-            GuestRegionMmap::new(mmap_region, guest_addr).map_err(VirtioError::InsertMmap)?,
-        );
+        let memory_region =
+            Arc::new(GuestRegionMmap::new(mmap_region, guest_addr).ok_or(VirtioError::InsertMmap)?);
 
         let vm_as_new = self
             .vm_as
             .memory()
             .insert_region(memory_region.clone())
-            .map_err(VirtioError::InsertMmap)?;
+            .map_err(|_| VirtioError::InsertMmap)?;
         self.vm_as.lock().unwrap().replace(vm_as_new);
         self.address_space.insert_region(region).map_err(|e| {
             error!(self.logger, "failed to insert address space region: {}", e);

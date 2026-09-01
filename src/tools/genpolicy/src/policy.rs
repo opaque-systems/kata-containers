@@ -26,6 +26,7 @@ use std::boxed;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
 use std::io::Write;
+use std::process::exit;
 
 /// Intermediary format of policy data.
 pub struct AgentPolicy {
@@ -64,6 +65,9 @@ pub struct PolicyData {
 
     /// Device settings read from genpolicy-settings.json.
     pub devices: Devices,
+
+    /// Cluster-level settings read from genpolicy-settings.json.
+    pub cluster_config: ClusterConfig,
 }
 
 /// OCI Container spec. This struct is very similar to the Spec struct from
@@ -371,6 +375,9 @@ pub struct AddARPNeighborsRequestDefaults {
     /// Explicitly blocked IP address ranges.
     /// Should include loopback addresses and other CIDRs that should not be routed outside the VM.
     forbidden_cidrs_regex: Vec<String>,
+
+    /// Allowed neighbor states. See https://www.man7.org/linux/man-pages/man8/ip-neighbour.8.html
+    allowed_states: Vec<u32>,
 }
 
 /// Settings specific to each kata agent endpoint, loaded from
@@ -406,6 +413,9 @@ pub struct RequestDefaults {
 
     /// Allow Host writing to Guest containers stdin.
     pub WriteStreamRequest: bool,
+
+    /// Allow Host to retrieve diagnostic data from the Guest.
+    pub GetDiagnosticDataRequest: bool,
 }
 
 /// Struct used to read data from the settings file and copy that data into the policy.
@@ -448,9 +458,7 @@ pub struct ClusterConfig {
     /// Pause container image reference.
     pub pause_container_image: String,
 
-    /// Whether or not the cluster uses the guest pull mechanism
-    /// In guest pull, host can't look into layers to determine GID.
-    /// See issue https://github.com/kata-containers/kata-containers/issues/11162
+    /// Whether or not the cluster uses the guest pull mechanism.
     pub guest_pull: bool,
 
     /// Supported values:
@@ -467,9 +475,14 @@ pub struct ClusterConfig {
     ///           as the only value* in AdditionalGids.
     pub pause_container_id_policy: String,
 
-    /// Whether emptyDirs are encrypted with modified metadata in the
-    /// mount and a storage object for the block device.
-    pub encrypted_emptydir: bool,
+    /// How emptyDirs are represented in the policy.
+    /// Supported values are "shared-fs", "block-encrypted", and "block-plain".
+    pub emptydir_type: String,
+
+    /// Cgroup v2 mount options that may appear beyond what genpolicy embeds
+    /// (e.g. "nsdelegate", "memory_recursiveprot" on newer kernels).
+    #[serde(default)]
+    pub cgroup_mount_extras_allowed: Vec<String>,
 }
 
 /// Describes patterns for supported VFIO devices.
@@ -638,6 +651,7 @@ impl AgentPolicy {
             common: self.config.settings.common.clone(),
             sandbox: self.config.settings.sandbox.clone(),
             devices: self.config.settings.devices.clone(),
+            cluster_config: self.config.settings.cluster_config.clone(),
         };
 
         let json_data = serde_json::to_string_pretty(&policy_data).unwrap();
@@ -796,6 +810,22 @@ impl AgentPolicy {
             }
         }
 
+        // Whether these appear on the OCI spec depends on the container runtime configuration
+        // (e.g. containerd `container_annotations` allowlisting `io.kubernetes.container.*`).
+        // When allowed, the kubelet passes path/policy (defaults: /dev/termination-log, File).
+        // Do not put them in OCI.Annotations — that would require every CreateContainer input to
+        // carry the same keys. Optional keys are allowed via runtime_anno_patterns instead.
+        if !is_pause_container {
+            runtime_anno_patterns.insert(
+                "^io\\.kubernetes\\.container\\.terminationMessagePath$".to_string(),
+                "^/.*$".to_string(),
+            );
+            runtime_anno_patterns.insert(
+                "^io\\.kubernetes\\.container\\.terminationMessagePolicy$".to_string(),
+                "^(File|FallbackToLogsOnError)$".to_string(),
+            );
+        }
+
         for default_device in &c_settings.Linux.Devices {
             linux.Devices.push(default_device.clone())
         }
@@ -821,6 +851,103 @@ impl AgentPolicy {
             exec_commands,
             runtime_anno_patterns,
         }
+    }
+
+    fn exit_if_guest_pull_needs_security_context(
+        &self,
+        resource: &dyn yaml::K8sResource,
+        yaml_container: &pod::Container,
+        is_pause_container: bool,
+        process: &KataProcess,
+    ) {
+        if is_pause_container || !self.config.settings.cluster_config.guest_pull {
+            return;
+        }
+
+        let pod_security_context = resource.get_pod_security_context();
+        let uid = i64::from(process.User.UID);
+        let gid = i64::from(process.User.GID);
+
+        let effective_run_as_user = yaml_container
+            .run_as_user()
+            .or_else(|| pod_security_context.and_then(|context| context.runAsUser));
+        let explicit_uid = effective_run_as_user == Some(uid);
+
+        let effective_run_as_group = yaml_container
+            .run_as_group()
+            .or_else(|| pod_security_context.and_then(|context| context.runAsGroup));
+        let explicit_gid = effective_run_as_group == Some(gid);
+
+        let mut explicitly_added_gids = BTreeSet::new();
+        if let Some(context) = pod_security_context {
+            if let Some(fs_group) = context.fsGroup {
+                explicitly_added_gids.insert(u32::try_from(fs_group).unwrap());
+            }
+            if let Some(supplemental_groups) = &context.supplementalGroups {
+                explicitly_added_gids.extend(supplemental_groups.iter().copied());
+            }
+        }
+
+        let missing_uid = process.User.UID != 0 && !explicit_uid;
+        let missing_gid = process.User.GID != 0 && !explicit_gid;
+
+        let missing_supplemental_groups: Vec<u32> = process
+            .User
+            .AdditionalGids
+            .iter()
+            .copied()
+            .filter(|additional_gid| {
+                *additional_gid != process.User.GID
+                    && !explicitly_added_gids.contains(additional_gid)
+            })
+            .collect();
+
+        if !missing_uid && !missing_gid && missing_supplemental_groups.is_empty() {
+            return;
+        }
+
+        let mut recommendations = Vec::new();
+        if missing_uid || missing_gid {
+            let mut container_recommendation = format!(
+                "containers:\n  - name: {}\n    securityContext:",
+                yaml_container.name
+            );
+            if process.User.UID != 0 {
+                container_recommendation
+                    .push_str(&format!("\n      runAsUser: {}", process.User.UID));
+            }
+            if process.User.GID != 0 {
+                container_recommendation
+                    .push_str(&format!("\n      runAsGroup: {}", process.User.GID));
+            }
+            recommendations.push(container_recommendation);
+        }
+        if !missing_supplemental_groups.is_empty() {
+            let supplemental_groups = missing_supplemental_groups
+                .iter()
+                .map(|gid| gid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            recommendations.push(format!(
+                "securityContext:\n  supplementalGroups: [{supplemental_groups}]"
+            ));
+        }
+        let recommendation = recommendations.join("\n");
+
+        eprintln!(
+            "ERROR: guest_pull is enabled for container '{}' using image '{}'. \
+             The generated policy expects UID={}, GID={}, AdditionalGids={:?}; \
+             containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. \
+             Set explicit Kubernetes securityContext values, for example:\n{}\n\
+             See docs/Limitations.md#guest-pulled-container-images.",
+            yaml_container.name,
+            yaml_container.image,
+            process.User.UID,
+            process.User.GID,
+            process.User.AdditionalGids,
+            recommendation
+        );
+        exit(1);
     }
 
     fn get_container_process(
@@ -883,7 +1010,7 @@ impl AgentPolicy {
             &self.config_maps,
             &self.secrets,
             namespace,
-            resource.get_annotations(),
+            resource,
             service_account_name,
         );
         debug!(
@@ -971,6 +1098,16 @@ impl AgentPolicy {
             );
         }
 
+        yaml::apply_pod_fs_group_and_supplemental_groups(
+            &mut process,
+            resource.get_pod_security_context(),
+            is_pause_container,
+        );
+        debug!(
+            "get_container_process: after apply_pod_fs_group_and_supplemental_groups: User = {:?}",
+            &process.User
+        );
+
         ///////////////////////////////////////////////////////////////////////////////////////
         // Container-level settings from user's YAML.
         yaml_container.get_process_fields(&mut process);
@@ -982,6 +1119,12 @@ impl AgentPolicy {
         debug!(
             "get_container_process: returning: User = {:?}",
             &process.User
+        );
+        self.exit_if_guest_pull_needs_security_context(
+            resource,
+            yaml_container,
+            is_pause_container,
+            &process,
         );
         process
     }

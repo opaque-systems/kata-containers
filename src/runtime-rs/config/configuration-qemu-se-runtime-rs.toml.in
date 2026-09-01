@@ -69,12 +69,6 @@ kernel_params = "@KERNELPARAMS@"
 # If you want that qemu uses the default firmware leave this option empty
 firmware = "@FIRMWAREPATH@"
 
-# Path to the firmware volume.
-# firmware TDVF or OVMF can be split into FIRMWARE_VARS.fd (UEFI variables
-# as configuration) and FIRMWARE_CODE.fd (UEFI program image). UEFI variables
-# can be customized per each user while UEFI code is kept same.
-firmware_volume = "@FIRMWAREVOLUMEPATH@"
-
 # Machine accelerators
 # comma-separated list of machine accelerators to pass to the hypervisor.
 # For example, `machine_accelerators = "nosmm,nosmbus,nosata,nopit,static-prt,nofw"`
@@ -82,12 +76,12 @@ machine_accelerators = "@MACHINEACCELERATORS@"
 
 # Qemu seccomp sandbox feature
 # comma-separated list of seccomp sandbox features to control the syscall access.
-# For example, `seccompsandbox= "on,obsolete=deny,spawn=deny,resourcecontrol=deny"`
+# For example, `seccomp_sandbox = "on,obsolete=deny,spawn=deny,resourcecontrol=deny"`
 # Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
 # Another note: enabling this feature may reduce performance, you may enable
 # /proc/sys/net/core/bpf_jit_enable to reduce the impact. see https://man7.org/linux/man-pages/man8/bpfc.8.html
 # Recommended value when enabling: "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
-seccompsandbox = "@DEFSECCOMPSANDBOXPARAM@"
+seccomp_sandbox = "@DEFSECCOMPSANDBOXPARAM@"
 
 # CPU features
 # comma-separated list of cpu features to pass to the cpu
@@ -100,6 +94,15 @@ cpu_features = "@CPUFEATURES@"
 # > 0 <= number of physical cores --> will be set to the specified number
 # > number of physical cores      --> will be set to the actual number of physical cores
 default_vcpus = @DEFVCPUS_QEMU@
+
+# Guest-side vCPU overhead budget (fractional) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_vcpus = requested_vcpus + overhead_vcpus
+# (rounded up at boot). If a workload limit is set on another dimension (for example
+# memory) but CPU is missing, requested_vcpus is treated as 0 and vm_vcpus equals
+# overhead_vcpus (minimum 1 at boot). When no workload limits are present,
+# default_vcpus is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_vcpus = @DEFOVERHEADVCPUS_TEE@
 
 # Default maximum number of vCPUs per SB/VM:
 # unspecified or == 0             --> will be set to the actual number of physical cores or to the maximum number
@@ -133,6 +136,14 @@ default_bridges = @DEFBRIDGES@
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFMEMSZ@
+
+# Guest-side memory overhead budget (MiB) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_memory = requested_memory + overhead_memory.
+# If a workload limit is set on another dimension (for example CPU) but memory is
+# missing, requested_memory is treated as 0, so vm_memory equals overhead_memory.
+# When no workload limits are present, default_memory is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_memory = @DEFOVERHEADMEMSZ_TEE_SE@
 #
 # Default memory slots per SB/VM.
 # If unspecified then it will be set @DEFMEMSLOTS@.
@@ -168,7 +179,6 @@ disable_block_device_use = @DEFDISABLEBLOCK@
 
 # Shared file system type:
 #   - virtio-fs (default)
-#   - virtio-9p
 #   - virtio-fs-nydus
 #   - none
 shared_fs = "@DEFSHAREDFS_QEMU_SEL_VIRTIOFS@"
@@ -251,11 +261,29 @@ block_device_cache_direct = false
 # Default false
 block_device_cache_noflush = false
 
+# Specifies the logical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_logical_sector_size = 0
+
+# Specifies the physical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_physical_sector_size = 0
+
 # Enable iothreads (data-plane) to be used. This causes IO to be
-# handled in a separate IO thread. This is currently only implemented
-# for SCSI.
+# handled in a separate IO thread. This is currently implemented
+# for virtio-scsi. For virtio-blk-pci hotplug, use indep_iothreads instead.
 #
 enable_iothreads = @DEFENABLEIOTHREADS@
+
+# Number of independent IO threads for virtio-blk-pci devices.
+# When set to a value greater than 0, creates dedicated IO threads
+# that are attached to virtio-blk-pci devices during hotplug.
+# Requires enable_iothreads = true; has no effect otherwise.
+# Default 0 (disabled).
+#
+indep_iothreads = @DEFINDEPIOTHREADS@
 
 # Virtio queue size. Size: byte. default 128
 queue_size = 128
@@ -306,17 +334,6 @@ enable_iommu_platform = false
 # Your distribution recommends: @DEFVALIDVHOSTUSERSTOREPATHS@
 valid_vhost_user_store_paths = @DEFVALIDVHOSTUSERSTOREPATHS@
 
-# Enable file based guest memory support. The default is an empty string which
-# will disable this feature. In the case of virtio-fs, this is enabled
-# automatically and '/dev/shm' is used as the backing folder.
-# This option will be ignored if VM templating is enabled.
-file_mem_backend = "@DEFFILEMEMBACKEND@"
-
-# List of valid annotations values for the file_mem_backend annotation
-# The default if not set is empty (all annotations rejected.)
-# Your distribution recommends: @DEFVALIDFILEMEMBACKENDS@
-valid_file_mem_backends = @DEFVALIDFILEMEMBACKENDS@
-
 # -pflash can add image file to VM. The arguments of it should be in format
 # of ["/path/to/flash0.img", "/path/to/flash1.img"]
 pflashes = []
@@ -333,10 +350,6 @@ enable_debug = false
 #
 disable_nesting_checks = false
 
-# This is the msize used for 9p shares. It is the number of bytes
-# used for 9p packet payload.
-msize_9p = @DEFMSIZE9P@
-
 # If false and nvdimm is supported, use nvdimm device to plug guest image.
 # Otherwise virtio-block device is used.
 #
@@ -345,29 +358,16 @@ msize_9p = @DEFMSIZE9P@
 # Default is false
 disable_image_nvdimm = true
 
-# Enable hot-plugging of VFIO devices to a bridge-port,
-# root-port or switch-port.
-# The default setting is "no-port"
-hot_plug_vfio = "no-port"
-
-# In a confidential compute environment hot-plugging can compromise
-# security.
-# Enable cold-plugging of VFIO devices to a bridge-port,
-# root-port or switch-port.
-# The default setting is "no-port", which means disabled.
-cold_plug_vfio = "no-port"
-
-# VFIO devices are hotplugged on a bridge by default.
-# Enable hotplugging on root bus. This may be required for devices with
-# a large PCI bar, as this is a current limitation with hotplugging on
-# a bridge.
-# Default false
-hotplug_vfio_on_root_bus = false
+# Enable cold-plugging of VFIO devices to a PCIe port type.
+# Accepted values: "no-port" (disabled), "root-port".
+# When set to "root-port", devices discovered via CDI / Pod Resources
+# are cold-plugged before VM boot.
+cold_plug_vfio = "root-port"
 
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means the number of pcie_root_port
-# This value is valid when hotplug_vfio_on_root_bus is true and machine_type is "q35"
+# This value is valid when machine_type is "q35"
 # Default 0
 pcie_root_port = 0
 
@@ -460,9 +460,6 @@ guest_memory_dump_paging = false
 # be default_memory.
 enable_guest_swap = false
 
-# use legacy serial for guest console if available and implemented for architecture. Default false
-use_legacy_serial = false
-
 # disable applying SELinux on the VMM process (default false)
 disable_selinux = @DEFDISABLESELINUX@
 
@@ -474,7 +471,7 @@ disable_selinux = @DEFDISABLESELINUX@
 disable_guest_selinux = @DEFDISABLEGUESTSELINUX@
 
 
-[factory]
+[hypervisor.qemu.factory]
 # VM templating support. Once enabled, new VMs are created from template
 # using vm cloning. They will share the same initial kernel, initramfs and
 # agent memory by mapping it readonly. It helps speeding up new container
@@ -533,17 +530,22 @@ kernel_modules = []
 debug_console_enabled = false
 
 # Agent dial timeout in millisecond.
-# (default: 10)
-dial_timeout_ms = 90
+# (default: 100)
+dial_timeout_ms = 100
 
 # Agent reconnect timeout in millisecond.
-# Retry times = reconnect_timeout_ms / dial_timeout_ms (default: 300)
+# Retry times = reconnect_timeout_ms / dial_timeout_ms (default: 450)
 # If you find pod cannot connect to the agent when starting, please
 # consider increasing this value to increase the retry times.
 # You'd better not change the value of dial_timeout_ms, unless you have an
 # idea of what you are doing.
-# (default: 3000)
-reconnect_timeout_ms = 5000
+# (default: 45000)
+reconnect_timeout_ms = 45000
+
+# Timeout in seconds for guest components (attestation-agent, confidential-data-hub)
+# to create their Unix sockets after being spawned by the agent.
+# (agent default when unset: 6)
+launch_process_timeout = 6
 
 # Create Container Request Timeout
 # This timeout value is used to set the maximum duration for the agent to process a CreateContainerRequest.
@@ -557,6 +559,10 @@ reconnect_timeout_ms = 5000
 # (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout)
 # Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)
 create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
+
+# Confidential Data Hub API timeout value in milliseconds
+# (default: 50000)
+cdh_api_timeout_ms = 50000
 
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
@@ -596,16 +602,7 @@ disable_guest_seccomp = @DEFDISABLEGUESTSECCOMP@
 # vCPUs pinning settings
 # if enabled, each vCPU thread will be scheduled to a fixed CPU
 # qualified condition: num(vCPU threads) == num(CPUs in sandbox's CPUSet)
-enable_vcpus_pinning = false
-
-# Apply a custom SELinux security policy to the container process inside the VM.
-# This is used when you want to apply a type other than the default `container_t`,
-# so general users should not uncomment and apply it.
-# (format: "user:role:type")
-# Note: You cannot specify MCS policy with the label because the sensitivity levels and
-# categories are determined automatically by high-level container runtimes such as containerd.
-# Example value when enabling: "system_u:system_r:container_t"
-guest_selinux_label = "@DEFGUESTSELINUXLABEL@"
+enable_vcpus_pinning = @DEFENABLEVCPUSPINNING_QEMU@
 
 # If enabled, the runtime will create opentracing.io traces and spans.
 # (See https://www.jaegertracing.io/docs/getting-started).
@@ -645,7 +642,7 @@ sandbox_cgroup_only = @DEFSANDBOXCGROUPONLY_QEMU@
 # - When running with pods, sandbox sizing information will only be available if using Kubernetes >= 1.23 and containerd >= 1.6. CRI-O
 #   does not yet support sandbox sizing annotations.
 # - When running single containers using a tool like ctr, container sizing information will be available.
-static_sandbox_resource_mgmt = @DEFSTATICRESOURCEMGMT_QEMU@
+static_sandbox_resource_mgmt = @DEFSTATICRESOURCEMGMT_COCO@
 
 # If specified, sandbox_bind_mounts identifieds host paths to be mounted (ro) into the sandboxes shared path.
 # This is only valid if filesystem sharing is utilized. The provided path(s) will be bindmounted into the shared fs directory.
@@ -674,17 +671,40 @@ sandbox_bind_mounts = @DEFBINDMOUNTS@
 #
 vfio_mode = "@DEFVFIOMODE_SE@"
 
-# If enabled, the runtime will not create Kubernetes emptyDir mounts on the guest filesystem. Instead, emptyDir mounts will
-# be created on the host and shared via virtio-fs. This is potentially slower, but allows sharing of files from host to guest.
-disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
+# Specifies how Kubernetes emptyDir volumes are handled.
+# Options:
+#
+#   - shared-fs (default)
+#     Shares the emptyDir folder with the guest using the method given
+#     by the `shared_fs` setting.
+#
+#   - block-encrypted
+#     Plugs a block device to be encrypted in the guest.
+#
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
+#
+emptydir_mode = "@DEFEMPTYDIRMODE_COCO@"
 
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
 # Supported experimental features:
+# for example:
+#       experimental = ["force_guest_pull"]
+# which enables force_guest_pull mode in CoCo scenarios.
 # (default: [])
 experimental = @DEFAULTEXPFEATURES@
 
 # If enabled, user can run pprof tools with shim v2 process through kata-monitor.
 # (default: false)
 enable_pprof = false
+
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"

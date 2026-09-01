@@ -98,6 +98,33 @@ CHART_PATH="$(get_chart_path)"
 	! grep -q "CUSTOM_RUNTIMES_ENABLED" /tmp/rendered.yaml
 }
 
+@test "Helm template: Default runtime drop-in works without custom runtimes" {
+	local values_file
+	values_file=$(mktemp)
+	cat > "${values_file}" <<EOF
+customRuntimes:
+  enabled: false
+shims:
+  qemu:
+    dropIn: |
+      [agent.kata]
+      dial_timeout = 999
+EOF
+
+	helm template kata-deploy "${CHART_PATH}" \
+		-f "${values_file}" \
+		--set image.reference=quay.io/kata-containers/kata-deploy \
+		--set image.tag=latest \
+		> /tmp/rendered.yaml
+	rm -f "${values_file}"
+
+	grep -q "kata-deploy-custom-configs" /tmp/rendered.yaml
+	grep -q "dropin-qemu.toml" /tmp/rendered.yaml
+	grep -q "dial_timeout = 999" /tmp/rendered.yaml
+	grep -q "mountPath: /custom-configs/" /tmp/rendered.yaml
+	! grep -q "CUSTOM_RUNTIMES_ENABLED" /tmp/rendered.yaml
+}
+
 @test "Helm template: Custom runtimes only mode (no standard shims)" {
 	# Test that Helm chart renders correctly when all standard shims are disabled
 	# using shims.disableAll and only custom runtimes are enabled
@@ -160,7 +187,7 @@ EOF
 	run kubectl get runtimeclass "${CUSTOM_RUNTIME_HANDLER}" -o name
 	if [[ "${status}" -ne 0 ]]; then
 		echo "# RuntimeClass not found. kata-deploy logs:" >&3
-		kubectl -n kube-system logs -l name=kata-deploy --tail=50 2>/dev/null || true
+		kubectl -n kube-system logs -l name=kata-deploy 2>/dev/null || true
 		die "Custom RuntimeClass ${CUSTOM_RUNTIME_HANDLER} not found"
 	fi
 
@@ -314,7 +341,7 @@ customRuntimes:
   enabled: true
   runtimes:
     ${CUSTOM_RUNTIME_NAME}:
-      baseConfig: "${KATA_HYPERVISOR:-qemu}"
+      baseConfig: "${KATA_HYPERVISOR:-qemu-runtime-rs}"
       dropIn: |
         [agent.kata]
         dial_timeout = 999
@@ -346,7 +373,7 @@ teardown() {
 		echo "# Test failed, gathering diagnostics..." >&3
 		kubectl describe pod "${TEST_POD_NAME}" 2>/dev/null || true
 		echo "# kata-deploy logs:" >&3
-		kubectl -n kube-system logs -l name=kata-deploy --tail=100 2>/dev/null || true
+		kubectl -n kube-system logs -l name=kata-deploy 2>/dev/null || true
 	fi
 
 	# Clean up test pod

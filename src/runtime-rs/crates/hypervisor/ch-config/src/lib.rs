@@ -75,6 +75,9 @@ pub struct CpusConfig {
     pub topology: Option<CpuTopology>,
     #[serde(default)]
     pub kvm_hyperv: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested: Option<bool>,
     #[serde(skip_serializing_if = "u8_is_zero")]
     pub max_phys_bits: u8,
     #[serde(default)]
@@ -120,7 +123,7 @@ pub enum ImageType {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DiskConfig {
     pub path: Option<PathBuf>,
     #[serde(default)]
@@ -145,8 +148,35 @@ pub struct DiskConfig {
     pub disable_io_uring: bool,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default = "default_diskconfig_sparse")]
+    pub sparse: bool,
     #[serde(default)]
     pub image_type: ImageType,
+}
+
+pub fn default_diskconfig_sparse() -> bool {
+    true
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            readonly: false,
+            direct: false,
+            iommu: false,
+            num_queues: 0,
+            queue_size: 0,
+            vhost_user: false,
+            vhost_socket: None,
+            rate_limiter_config: None,
+            id: None,
+            disable_io_uring: false,
+            pci_segment: 0,
+            sparse: default_diskconfig_sparse(),
+            image_type: ImageType::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -227,6 +257,12 @@ pub struct MemoryZoneConfig {
     pub hotplugged_size: Option<u64>,
     #[serde(default)]
     pub prefault: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProtectionDevConfig {
+    pub mrconfigid: Option<String>,
+    pub host_data: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -330,6 +366,10 @@ pub struct PayloadConfig {
     pub cmdline: Option<String>,
     #[serde(default)]
     pub initramfs: Option<PathBuf>,
+    #[serde(default)]
+    pub mrconfigid: Option<String>,
+    #[serde(default)]
+    pub host_data: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -510,6 +550,7 @@ pub struct NamedHypervisorConfig {
     // - The hardware supports guest protection.
     // - The user has requested that guest protection be used.
     pub guest_protection_to_use: GuestProtection,
+    pub protection_device: Option<ProtectionDevConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

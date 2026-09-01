@@ -81,6 +81,14 @@ fn convert_string_to_slog_level(string_level: &str) -> slog::Level {
     }
 }
 
+fn effective_log_level(enable_debug: bool, log_level: &str) -> &str {
+    if enable_debug && log_level == "info" {
+        "debug"
+    } else {
+        log_level
+    }
+}
+
 struct RuntimeHandlerManagerInner {
     id: String,
     msg_sender: Sender<Message>,
@@ -215,6 +223,13 @@ impl RuntimeHandlerManagerInner {
             InitialSizeManager::new_from(&sandbox_config.annotations)
                 .context("failed to construct static resource manager")?
         };
+
+        // For CRI sandboxes, sizing annotations are carried in PodSandboxConfig
+        // and may be absent from the OCI sandbox spec. Fill any missing sizing
+        // values from sandbox annotations before applying static sizing.
+        initial_size_manager
+            .supplement_from_annotations(&sandbox_config.annotations)
+            .context("failed to supplement static resource manager from annotations")?;
 
         initial_size_manager
             .setup_config(&mut config)
@@ -389,6 +404,22 @@ impl RuntimeHandlerManager {
             }
         }
 
+        // When the OCI spec contains a network namespace with path `/proc/0/ns/net`,
+        // it means the task PID was not yet known at spec generation time (PID 0 is a
+        // placeholder).  containerd populates the netns path before the shim returns
+        // a real PID via the Connect RPC.  Treat this as "no netns provided" so the
+        // rescan mechanism can discover the correct namespace later.
+        if netns.as_deref() == Some("/proc/0/ns/net") {
+            netns = None;
+        }
+        // Docker 26+ may not publish the network namespace in `linux.namespaces` at create; use
+        // `libnetwork-setkey` hook args (see Go `DockerNetnsPath` and #9340).
+        if netns.is_none() {
+            if let Some(p) = kata_sys_util::oci_docker::docker_netns_path(spec) {
+                netns = Some(p);
+            }
+        }
+
         // A nerdctl network namespace to let nerdctl know which namespace to use when calling the
         // selected CNI plugin.
         if let Some(netns_path) = &netns {
@@ -519,6 +550,29 @@ impl RuntimeHandlerManager {
 
             Ok(TaskResponse::CreateContainer(shim_pid))
         } else {
+            // A teardown RPC must still make the shim daemon exit even when
+            // the runtime instance was never (fully) created -- e.g. after a
+            // failed CreateContainer.  In that case containerd's follow-up
+            // Shutdown would otherwise hit `get_runtime_instance()`, fail with
+            // "runtime not ready", and the service loop would never receive
+            // `Action::Shutdown`.  Because the shim ignores SIGTERM the daemon
+            // would then be left running and orphaned by containerd.
+            if let TaskRequest::ShutdownContainer(_) = &req {
+                if self.get_runtime_instance().await.is_err() {
+                    warn!(
+                        sl!(),
+                        "shutdown requested but runtime instance is not ready; \
+                         forcing shim exit to avoid an orphaned shim process"
+                    );
+                    let sender = self.inner.read().await.msg_sender.clone();
+                    sender
+                        .send(Message::new(Action::Shutdown))
+                        .await
+                        .context("send shutdown message")?;
+                    return Ok(TaskResponse::ShutdownContainer);
+                }
+            }
+
             self.handler_task_request(req)
                 .await
                 .context("handler TaskRequest")
@@ -565,7 +619,7 @@ impl RuntimeHandlerManager {
                     sandbox_id: status.sandbox_id,
                     pid: status.pid,
                     state: status.state,
-                    created_at: None,
+                    created_at: status.created_at,
                     exited_at: None,
                 }))
             }
@@ -635,10 +689,32 @@ impl RuntimeHandlerManager {
                 let exit_status = cm.wait_process(&process_id).await.context("wait process")?;
                 if cm.is_sandbox_container(&process_id).await {
                     sandbox.stop().await.context("stop sandbox")?;
+
+                    // Release sandbox resources (cgroup, network, mounts, ...)
+                    // as soon as the sandbox container exits instead of waiting
+                    // for an explicit ShutdownContainer/Delete RPC.  Engines
+                    // like Docker only send those when the container is removed
+                    // (e.g. with `--rm`); without this the sandbox cgroup would
+                    // leak and collide with the next run.
+                    sandbox.cleanup().await.context("cleanup sandbox")?;
                 }
                 Ok(TaskResponse::WaitProcess(exit_status))
             }
             TaskRequest::StartProcess(process_id) => {
+                // Docker 26+ configures the veth between the Create and Start
+                // RPCs.  Rescan now so interfaces are wired before the process
+                // starts.  The rescan uses a lightweight netlink probe during
+                // polling and only does the expensive endpoint setup once
+                // interfaces are detected.
+                if process_id.process_type == ProcessType::Container {
+                    if let Err(e) = sandbox.rescan_network().await {
+                        error!(
+                            sl!(),
+                            "network rescan failed; container may lack networking: {:?}", e
+                        );
+                    }
+                }
+
                 let shim_pid = cm
                     .start_process(&process_id)
                     .await
@@ -733,20 +809,26 @@ impl Env for RootlessEnv {
 }
 
 /// Config override ordering(high to low):
-/// 1. podsandbox annotation
-/// 2. environment variable
-/// 3. shimv2 create task option
-/// 4. If above three are not set, then get default path from DEFAULT_RUNTIME_CONFIGURATIONS
+/// 1. environment variable
+/// 2. shimv2 create task option
+/// 3. If above two are not set, then get default path from DEFAULT_RUNTIME_CONFIGURATIONS
 /// in kata-containers/src/libs/kata-types/src/config/default.rs, in array order.
 #[instrument]
 fn load_config(an: &HashMap<String, String>, option: &Option<Vec<u8>>) -> Result<TomlConfig> {
     const KATA_CONF_FILE: &str = "KATA_CONF_FILE";
     let annotation = Annotation::new(an.clone());
+    // Clone a logger from global logger to ensure the logs in this function get flushed when drop
+    let logger = slog::Logger::clone(&slog_scope::logger());
 
-    let config_path = if let Some(path) = annotation.get_sandbox_config_path() {
-        path
-    } else if let Ok(path) = std::env::var(KATA_CONF_FILE) {
-        path
+    let config_path = if let Ok(path) = std::env::var(KATA_CONF_FILE) {
+        if is_shipped_kata_config_path(&path) {
+            path
+        } else {
+            return Err(anyhow!(
+                "invalid KATA_CONF_FILE {:?}: only shipped Kata configuration files are accepted",
+                path
+            ));
+        }
     } else if let Some(option) = option {
         // Parse the containerd runtime options protobuf message to extract the config path.
         // The options are passed as a serialized runtimeoptions.v1.Options protobuf message
@@ -768,9 +850,6 @@ fn load_config(an: &HashMap<String, String>, option: &Option<Vec<u8>>) -> Result
         String::from("")
     };
 
-    // Clone a logger from global logger to ensure the logs in this function get flushed when drop
-    let logger = slog::Logger::clone(&slog_scope::logger());
-
     info!(logger, "get config path {:?}", &config_path);
     let (mut toml_config, _) = TomlConfig::load_from_file(&config_path).context(format!(
         "load TOML config failed (tried {:?})",
@@ -784,6 +863,21 @@ fn load_config(an: &HashMap<String, String>, option: &Option<Vec<u8>>) -> Result
 
     info!(logger, "get config content {:?}", &toml_config);
     Ok(toml_config)
+}
+
+fn is_shipped_kata_config_path(config_path: &str) -> bool {
+    config_path_matches_defaults(config_path, TomlConfig::get_default_config_file_list())
+}
+
+fn config_path_matches_defaults(config_path: &str, default_config_paths: Vec<PathBuf>) -> bool {
+    let Ok(resolved_config_path) = std::fs::canonicalize(config_path) else {
+        return false;
+    };
+
+    default_config_paths
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| path == resolved_config_path)
 }
 
 // this update the agent-specfic kernel parameters into hypervisor's bootinfo
@@ -807,19 +901,22 @@ fn update_agent_kernel_params(config: &mut TomlConfig) -> Result<()> {
 // according to the settings read from configuration file
 fn update_component_log_level(config: &TomlConfig) {
     // Retrieve the log-levels set in configuration file, modify the FILTER_RULE accordingly
-    let default_level = String::from("info");
+    let default_level = "info";
     let agent_level = if let Some(agent_config) = config.agent.get(&config.runtime.agent_name) {
-        agent_config.log_level.clone()
+        effective_log_level(agent_config.debug, &agent_config.log_level)
     } else {
-        default_level.clone()
+        default_level
     };
     let hypervisor_level =
         if let Some(hypervisor_config) = config.hypervisor.get(&config.runtime.hypervisor_name) {
-            hypervisor_config.debug_info.log_level.clone()
+            effective_log_level(
+                hypervisor_config.debug_info.enable_debug,
+                &hypervisor_config.debug_info.log_level,
+            )
         } else {
-            default_level.clone()
+            default_level
         };
-    let runtime_level = config.runtime.log_level.clone();
+    let runtime_level = effective_log_level(config.runtime.debug, &config.runtime.log_level);
 
     // Update FILTER_RULE to apply changes
     FILTER_RULE.rcu(|inner| {
@@ -827,15 +924,15 @@ fn update_component_log_level(config: &TomlConfig) {
         updated_inner.clone_from(inner);
         updated_inner.insert(
             "runtimes".to_string(),
-            convert_string_to_slog_level(&runtime_level),
+            convert_string_to_slog_level(runtime_level),
         );
         updated_inner.insert(
             "agent".to_string(),
-            convert_string_to_slog_level(&agent_level),
+            convert_string_to_slog_level(agent_level),
         );
         updated_inner.insert(
             "hypervisor".to_string(),
-            convert_string_to_slog_level(&hypervisor_level),
+            convert_string_to_slog_level(hypervisor_level),
         );
         updated_inner
     });
@@ -919,4 +1016,92 @@ fn configure_non_root_hypervisor(config: &mut Hypervisor) -> Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::types::ShutdownRequest;
+    use rstest::rstest;
+    use tokio::sync::mpsc::channel;
+
+    // A ShutdownContainer RPC that arrives before any runtime instance was
+    // created (e.g. after a failed CreateContainer) must still drive the shim
+    // daemon to exit, otherwise the process is orphaned.  Verify it returns
+    // ShutdownContainer and emits Action::Shutdown on the service channel.
+    #[tokio::test]
+    async fn test_shutdown_without_runtime_instance_forces_exit() {
+        let (sender, mut receiver) = channel::<Message>(8);
+        let manager = RuntimeHandlerManager::new("test-sid", sender).unwrap();
+
+        let resp = manager
+            .handler_task_message(TaskRequest::ShutdownContainer(ShutdownRequest {
+                container_id: "test-sid".to_string(),
+                is_now: true,
+            }))
+            .await
+            .expect("shutdown should succeed even without a runtime instance");
+
+        assert!(matches!(resp, TaskResponse::ShutdownContainer));
+
+        let msg = receiver
+            .try_recv()
+            .expect("an Action::Shutdown message must be sent to stop the daemon");
+        assert!(matches!(msg.action, Action::Shutdown));
+    }
+
+    #[test]
+    fn test_effective_log_level() {
+        assert_eq!(effective_log_level(false, "info"), "info");
+        assert_eq!(effective_log_level(false, "debug"), "debug");
+        assert_eq!(effective_log_level(true, "info"), "debug");
+        assert_eq!(effective_log_level(true, "trace"), "trace");
+        assert_eq!(effective_log_level(true, "warn"), "warn");
+    }
+
+    #[derive(Debug)]
+    enum ConfigPathCase {
+        Shipped,
+        NonShipped,
+        NonExistent,
+        Empty,
+    }
+
+    #[rstest]
+    #[case::shipped_config_is_accepted(ConfigPathCase::Shipped, true)]
+    #[case::non_shipped_config_is_rejected(ConfigPathCase::NonShipped, false)]
+    #[case::non_existent_path_is_rejected(ConfigPathCase::NonExistent, false)]
+    #[case::empty_path_is_rejected(ConfigPathCase::Empty, false)]
+    fn test_config_path_matches_defaults(
+        #[case] path_case: ConfigPathCase,
+        #[case] expected: bool,
+    ) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let shipped_path = tmpdir.path().join("shipped.toml");
+        let non_shipped_path = tmpdir.path().join("malicious.toml");
+        std::fs::write(&shipped_path, b"[hypervisor.qemu]\n").unwrap();
+        std::fs::write(&non_shipped_path, b"[hypervisor.qemu]\n").unwrap();
+
+        // Only the shipped path is treated as a default config location.
+        let default_config_paths = vec![shipped_path.clone()];
+
+        let config_path = match path_case {
+            ConfigPathCase::Shipped => shipped_path.to_string_lossy().to_string(),
+            ConfigPathCase::NonShipped => non_shipped_path.to_string_lossy().to_string(),
+            ConfigPathCase::NonExistent => tmpdir
+                .path()
+                .join("nonexistent.toml")
+                .to_string_lossy()
+                .to_string(),
+            ConfigPathCase::Empty => String::new(),
+        };
+
+        assert_eq!(
+            config_path_matches_defaults(&config_path, default_config_paths),
+            expected,
+            "case {:?}: unexpected result for path {:?}",
+            path_case,
+            config_path,
+        );
+    }
 }

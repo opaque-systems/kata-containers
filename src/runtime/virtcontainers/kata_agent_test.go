@@ -338,6 +338,46 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 				},
 			},
 		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				BlockDeviceCreateFs: true,
+				Options:             []string{blockVolumeDiscardOption},
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver:        kataBlkDevType,
+				Source:        testPCIPath.String(),
+				DriverOptions: []string{volume.BlockVolumeCreateFsDriverKey},
+				Options:       []string{blockVolumeDiscardOption},
+			},
+		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				EncryptionKey:       "ephemeral",
+				BlockDeviceCreateFs: true,
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver: kataBlkDevType,
+				Source: testPCIPath.String(),
+				DriverOptions: []string{
+					encryptionKeyDriverOption + "=ephemeral",
+					volume.BlockVolumeCreateFsDriverKey,
+				},
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -603,6 +643,10 @@ func TestConstrainGRPCSpec(t *testing.T) {
 					Path: "/abc/123",
 				},
 				{
+					Type: string(specs.TimeNamespace),
+					Path: "/proc/123/ns/time",
+				},
+				{
 					Type: string(specs.MountNamespace),
 					Path: "/abc/123",
 				},
@@ -634,7 +678,7 @@ func TestConstrainGRPCSpec(t *testing.T) {
 	}
 
 	k := kataAgent{}
-	k.constrainGRPCSpec(g, true, true, "", true)
+	k.constrainGRPCSpec(g, true, true, "", true, nil)
 
 	// Check nil fields
 	assert.Nil(g.Hooks)
@@ -1079,67 +1123,73 @@ func TestKataCleanupSandbox(t *testing.T) {
 }
 
 func TestKataAgentKernelParams(t *testing.T) {
-	assert := assert.New(t)
-
 	// nolint: govet
 	type testData struct {
-		debug             bool
-		trace             bool
-		containerPipeSize uint32
-		expectedParams    []Param
+		name                 string
+		debug                bool
+		trace                bool
+		containerPipeSize    uint32
+		launchProcessTimeout uint32
+		visibleCdiDevices    bool
+		expectedParams       []Param
 	}
 
 	debugParam := Param{Key: "agent.log", Value: "debug"}
 	traceParam := Param{Key: "agent.trace", Value: "true"}
 
 	containerPipeSizeParam := Param{Key: vcAnnotations.ContainerPipeSizeKernelParam, Value: "2097152"}
+	launchProcessTimeoutParam := Param{Key: vcAnnotations.LaunchProcessTimeoutKernelParam, Value: "60"}
+	visibleCdiDevicesParam := Param{Key: "agent.visible_cdi_devices", Value: "true"}
 
 	data := []testData{
-		{false, false, 0, []Param{}},
+		{name: "no options", expectedParams: []Param{}},
 
-		// Debug
-		{true, false, 0, []Param{debugParam}},
+		{name: "debug", debug: true, expectedParams: []Param{debugParam}},
 
-		// Tracing
-		{false, true, 0, []Param{traceParam}},
+		{name: "tracing", trace: true, expectedParams: []Param{traceParam}},
 
-		// Debug + Tracing
-		{true, true, 0, []Param{debugParam, traceParam}},
+		{name: "debug and tracing", debug: true, trace: true, expectedParams: []Param{debugParam, traceParam}},
 
-		// pipesize
-		{false, false, 2097152, []Param{containerPipeSizeParam}},
+		{name: "pipesize", containerPipeSize: 2097152, expectedParams: []Param{containerPipeSizeParam}},
 
-		// Debug + pipesize
-		{true, false, 2097152, []Param{debugParam, containerPipeSizeParam}},
+		{name: "debug and pipesize", debug: true, containerPipeSize: 2097152, expectedParams: []Param{debugParam, containerPipeSizeParam}},
 
-		// Tracing + pipesize
-		{false, true, 2097152, []Param{traceParam, containerPipeSizeParam}},
+		{name: "tracing and pipesize", trace: true, containerPipeSize: 2097152, expectedParams: []Param{traceParam, containerPipeSizeParam}},
 
-		// Debug + Tracing + pipesize
-		{true, true, 2097152, []Param{debugParam, traceParam, containerPipeSizeParam}},
+		{name: "debug, tracing and pipesize", debug: true, trace: true, containerPipeSize: 2097152, expectedParams: []Param{debugParam, traceParam, containerPipeSizeParam}},
+
+		{name: "launch process timeout", launchProcessTimeout: 60, expectedParams: []Param{launchProcessTimeoutParam}},
+
+		{name: "debug and launch process timeout", debug: true, launchProcessTimeout: 60, expectedParams: []Param{debugParam, launchProcessTimeoutParam}},
+
+		{name: "visible cdi devices", visibleCdiDevices: true, expectedParams: []Param{visibleCdiDevicesParam}},
 	}
 
-	for i, d := range data {
-		config := KataAgentConfig{
-			Debug:             d.debug,
-			Trace:             d.trace,
-			ContainerPipeSize: d.containerPipeSize,
-		}
+	for _, d := range data {
+		t.Run(d.name, func(t *testing.T) {
+			assert := assert.New(t)
 
-		count := len(d.expectedParams)
+			config := KataAgentConfig{
+				Debug:                d.debug,
+				Trace:                d.trace,
+				ContainerPipeSize:    d.containerPipeSize,
+				LaunchProcessTimeout: d.launchProcessTimeout,
+				VisibleCdiDevices:    d.visibleCdiDevices,
+			}
 
-		params := KataAgentKernelParams(config)
+			params := KataAgentKernelParams(config)
 
-		if count == 0 {
-			assert.Emptyf(params, "test %d (%+v)", i, d)
-			continue
-		}
+			if len(d.expectedParams) == 0 {
+				assert.Empty(params)
+				return
+			}
 
-		assert.Len(params, count)
+			assert.Len(params, len(d.expectedParams))
 
-		for _, p := range d.expectedParams {
-			assert.Containsf(params, p, "test %d (%+v)", i, d)
-		}
+			for _, p := range d.expectedParams {
+				assert.Contains(params, p)
+			}
+		})
 	}
 }
 
@@ -1271,7 +1321,7 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 			hotPlugVFIO:   config.NoPort,
 			coldPlugVFIO:  config.BridgePort,
 			vfioMode:      config.VFIOModeGuestKernel,
-			expectVFIODev: false,
+			expectVFIODev: true,
 		},
 	}
 
@@ -1356,4 +1406,52 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTranslateHostMemsToGuest(t *testing.T) {
+	assert := assert.New(t)
+
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-3"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+
+	result := translateHostMemsToGuest("0", numaNodes)
+	assert.Equal("0", result)
+
+	result = translateHostMemsToGuest("1", numaNodes)
+	assert.Equal("1", result)
+
+	result = translateHostMemsToGuest("0-1", numaNodes)
+	assert.Equal("0-1", result)
+
+	result = translateHostMemsToGuest("0,1", numaNodes)
+	assert.Equal("0-1", result)
+
+	result = translateHostMemsToGuest("42", numaNodes)
+	assert.Equal("", result)
+
+	result = translateHostMemsToGuest("invalid", numaNodes)
+	assert.Equal("", result)
+
+	result = translateHostMemsToGuest("", numaNodes)
+	assert.Equal("", result)
+}
+
+func TestTranslateHostMemsToGuestRangeNodes(t *testing.T) {
+	assert := assert.New(t)
+
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0-1", HostCPUs: "0-7"},
+		{HostNodes: "2-3", HostCPUs: "8-15"},
+	}
+
+	result := translateHostMemsToGuest("1", numaNodes)
+	assert.Equal("0", result)
+
+	result = translateHostMemsToGuest("2", numaNodes)
+	assert.Equal("1", result)
+
+	result = translateHostMemsToGuest("0,3", numaNodes)
+	assert.Equal("0-1", result)
 }

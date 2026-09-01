@@ -184,13 +184,9 @@ pub struct HypervisorInfo {
     #[serde(default)]
     virtio_fs_daemon: String,
     #[serde(default)]
-    msize_9p: u32,
-    #[serde(default)]
     memory_slots: u32,
     #[serde(default)]
     pcie_root_port: u32,
-    #[serde(default)]
-    hotplug_vfio_on_rootbus: bool,
     #[serde(default)]
     debug: bool,
     #[serde(default)]
@@ -417,10 +413,8 @@ pub fn get_hypervisor_info(
             .clone()
             .unwrap_or_else(|| String::from("none")),
         virtio_fs_daemon: hypervisor_config.shared_fs.virtio_fs_daemon.to_string(),
-        msize_9p: hypervisor_config.shared_fs.msize_9p,
         memory_slots: hypervisor_config.memory_info.memory_slots,
         pcie_root_port: hypervisor_config.device_info.pcie_root_port,
-        hotplug_vfio_on_rootbus: hypervisor_config.device_info.hotplug_vfio_on_root_bus,
         debug: hypervisor_config.debug_info.enable_debug,
         enable_iommu: hypervisor_config.device_info.enable_iommu,
         enable_iommu_platform: hypervisor_config.device_info.enable_iommu_platform,
