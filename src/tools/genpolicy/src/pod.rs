@@ -915,12 +915,12 @@ impl EnvVar {
                 return Some("$(resource-field)".to_string());
             }
 
-            panic!("Couldn't get the value of env var: {}", &self.name);
+            // TODO: even if the secretKeyRef can be found, we should replace the
+            // real value with $(any-value) too.
+            return Some("$(any-value)".to_string());
         }
 
-        // TODO: even if the secretKeyRef can be found, we should replace the 
-        // real value with $(any-value) too.
-        return Some("$(any-value)".to_string())
+        None
     }
 
     fn get_value_from_field_ref(
