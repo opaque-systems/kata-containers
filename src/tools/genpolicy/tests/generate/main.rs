@@ -17,9 +17,11 @@ fn config_map_in_separate_file_config_map_flag() -> Result<(), Box<dyn std::erro
     let config_file = "config_map.yaml";
     let workdir = prepare_workdir(test_case_dir, &[pod_yaml_name, config_file]);
 
+    // Opaque: an unresolved configMapKeyRef/secretKeyRef falls back to
+    // $(any-value) instead of failing policy generation.
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
-    cmd.assert().failure();
+    cmd.assert().success();
 
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
@@ -37,9 +39,11 @@ fn config_map_in_separate_file_workdir_flag() -> Result<(), Box<dyn std::error::
     let config_file = "config_map.yaml";
     let workdir = prepare_workdir(test_case_dir, &[pod_yaml_name, config_file]);
 
+    // Opaque: an unresolved configMapKeyRef/secretKeyRef falls back to
+    // $(any-value) instead of failing policy generation.
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
-    cmd.assert().failure();
+    cmd.assert().success();
 
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
@@ -57,9 +61,11 @@ fn secret_in_separate_file() -> Result<(), Box<dyn std::error::Error>> {
     let config_file = "secret.yaml";
     let workdir = prepare_workdir(test_case_dir, &[pod_yaml_name, config_file]);
 
+    // Opaque: an unresolved configMapKeyRef/secretKeyRef falls back to
+    // $(any-value) instead of failing policy generation.
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
-    cmd.assert().failure();
+    cmd.assert().success();
 
     let mut cmd = Command::cargo_bin("genpolicy")?;
     cmd.arg("--yaml-file").arg(workdir.join(pod_yaml_name));
