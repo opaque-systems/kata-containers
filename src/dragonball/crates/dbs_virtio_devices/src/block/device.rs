@@ -20,7 +20,7 @@ use dbs_utils::{
 };
 use log::{debug, error, info, warn};
 use virtio_bindings::bindings::virtio_blk::*;
-use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
+use virtio_bindings::bindings::virtio_config::{VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1};
 use virtio_queue::QueueT;
 use vm_memory::GuestMemoryRegion;
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
@@ -84,6 +84,7 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
         queue_sizes: Arc<Vec<u16>>,
         epoll_mgr: EpollManager,
         rate_limiters: Vec<RateLimiter>,
+        f_access_platform: bool,
     ) -> Result<Self> {
         let num_queues = disk_images.len();
 
@@ -103,6 +104,10 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
         let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
         avail_features |= 1u64 << VIRTIO_BLK_F_SIZE_MAX;
         avail_features |= 1u64 << VIRTIO_BLK_F_SEG_MAX;
+
+        if f_access_platform {
+            avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+        }
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -214,6 +219,26 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
         }
 
         Ok(())
+    }
+}
+
+impl<'a, AS: DbsGuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for Block<AS> {
+    type State = crate::persist::VirtioDeviceInfoState;
+    type SaveArgs = ();
+    type RestoreArgs = ();
+    type Error = crate::Error;
+
+    /// Capture the guest-negotiated state of this device.
+    fn save_state(&mut self, _args: ()) -> crate::Result<Self::State> {
+        Ok(self.device_info.save_state())
+    }
+
+    /// Restore the guest-negotiated state of this device.
+    ///
+    /// The device must have been re-created with the same configuration and
+    /// must not have been activated yet.
+    fn restore_state(&mut self, state: &Self::State, _args: ()) -> crate::Result<()> {
+        self.device_info.restore_state(state)
     }
 }
 
@@ -986,6 +1011,7 @@ mod tests {
             Arc::new(vec![128]),
             epoll_mgr,
             vec![],
+            false,
         )
         .unwrap();
 
@@ -1044,6 +1070,7 @@ mod tests {
                 Arc::new(vec![128]),
                 epoll_mgr.clone(),
                 vec![],
+                false,
             )
             .unwrap();
 
@@ -1082,6 +1109,7 @@ mod tests {
                 Arc::new(vec![128]),
                 epoll_mgr.clone(),
                 vec![],
+                false,
             )
             .unwrap();
             dev.disk_images = vec![];
@@ -1121,6 +1149,7 @@ mod tests {
                 Arc::new(vec![128]),
                 epoll_mgr,
                 vec![],
+                false,
             )
             .unwrap();
 
@@ -1159,6 +1188,7 @@ mod tests {
             Arc::new(vec![128]),
             epoll_mgr,
             vec![],
+            false,
         )
         .unwrap();
 

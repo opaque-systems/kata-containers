@@ -11,6 +11,10 @@ set -o pipefail
 kubernetes_dir="${kubernetes_dir:-$(dirname "$(readlink -f "$0")")}"
 # shellcheck source=/dev/null
 source "${kubernetes_dir}/../../common.bash"
+# shellcheck source=/dev/null
+source "${kubernetes_dir}/tests_common.sh"
+# shellcheck source=/dev/null
+source "${kubernetes_dir}/k8s_bats_runner.sh"
 
 cleanup() {
 	# Clean up all node debugger pods whose name starts with `custom-node-debugger` if pods exist
@@ -73,6 +77,7 @@ else
 		"k8s-credentials-secrets.bats" \
 		"k8s-cron-job.bats" \
 		"k8s-custom-dns.bats" \
+		"k8s-devkit-debug-console.bats" \
 		"k8s-empty-dirs.bats" \
 		"k8s-env.bats" \
 		"k8s-erofs-dmverity.bats" \
@@ -101,14 +106,18 @@ else
 		"k8s-privileged.bats" \
 		"k8s-projected-volume.bats" \
 		"k8s-replication.bats" \
+		"k8s-rootless-vmm.bats" \
 		"k8s-sandbox-cgroup.bats" \
+		"k8s-sandbox-cgroup-placement.bats" \
 		"k8s-seccomp.bats" \
 		"k8s-sysctls.bats" \
 		"k8s-security-context.bats" \
 		"k8s-shared-volume.bats" \
+		"k8s-uds-shared-volume.bats" \
 		"k8s-volume.bats" \
 		"k8s-vm-templating.bats" \
 		"k8s-nginx-connectivity.bats" \
+		"k8s-l3forwarding-connectivity.bats" \
 	)
 
 	K8S_TEST_NORMAL_HOST_UNION=( \
@@ -154,6 +163,7 @@ fi
 
 ensure_yq
 
-# Use common bats test runner with proper reporting
+# Use common bats test runner with proper reporting, plain RuntimeClass by
+# default, and triage-only -debug re-runs for failed cases.
 export BATS_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST}"
-run_bats_tests "${kubernetes_dir}" K8S_TEST_UNION
+run_kubernetes_bats_tests "${kubernetes_dir}" K8S_TEST_UNION

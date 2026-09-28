@@ -22,7 +22,7 @@ use dbs_utils::net::{net_gen, MacAddr, Tap};
 use dbs_utils::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
 use libc;
 use log::{debug, error, info, trace, warn};
-use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
+use virtio_bindings::bindings::virtio_config::{VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_net::*;
 use virtio_queue::{QueueOwnedT, QueueSync, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryRegion, GuestRegionMmap};
@@ -612,6 +612,7 @@ impl<AS: GuestAddressSpace> Net<AS> {
         event_mgr: EpollManager,
         rx_rate_limiter: Option<RateLimiter>,
         tx_rate_limiter: Option<RateLimiter>,
+        f_access_platform: bool,
     ) -> Result<Self> {
         trace!(target: "virtio-net", "{NET_DRIVER_NAME}: Net::new_with_tap()");
 
@@ -633,6 +634,10 @@ impl<AS: GuestAddressSpace> Net<AS> {
             | (1u64 << VIRTIO_NET_F_HOST_TSO4)
             | (1u64 << VIRTIO_NET_F_HOST_UFO)
             | (1u64 << VIRTIO_F_VERSION_1);
+
+        if f_access_platform {
+            avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+        }
 
         let config_space = setup_config_space(
             NET_DRIVER_NAME,
@@ -673,6 +678,7 @@ impl<AS: GuestAddressSpace> Net<AS> {
         epoll_mgr: EpollManager,
         rx_rate_limiter: Option<RateLimiter>,
         tx_rate_limiter: Option<RateLimiter>,
+        f_access_platform: bool,
     ) -> Result<Self> {
         info!("open net tap {host_dev_name}");
         let tap = Tap::open_named(host_dev_name.as_str(), false)
@@ -686,11 +692,32 @@ impl<AS: GuestAddressSpace> Net<AS> {
             epoll_mgr,
             rx_rate_limiter,
             tx_rate_limiter,
+            f_access_platform,
         )
     }
 
     pub fn metrics(&self) -> Arc<NetDeviceMetrics> {
         self.metrics.clone()
+    }
+}
+
+impl<'a, AS: GuestAddressSpace> crate::persist::VirtioDevicePersist<'a> for Net<AS> {
+    type State = crate::persist::VirtioDeviceInfoState;
+    type SaveArgs = ();
+    type RestoreArgs = ();
+    type Error = crate::Error;
+
+    /// Capture the guest-negotiated state of this device.
+    fn save_state(&mut self, _args: ()) -> crate::Result<Self::State> {
+        Ok(self.device_info.save_state())
+    }
+
+    /// Restore the guest-negotiated state of this device.
+    ///
+    /// The device must have been re-created with the same configuration and
+    /// must not have been activated yet.
+    fn restore_state(&mut self, state: &Self::State, _args: ()) -> crate::Result<()> {
+        self.device_info.restore_state(state)
     }
 }
 
@@ -911,6 +938,7 @@ mod tests {
             epoll_mgr,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -976,6 +1004,7 @@ mod tests {
                 epoll_mgr.clone(),
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1010,6 +1039,7 @@ mod tests {
                 epoll_mgr.clone(),
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1047,6 +1077,7 @@ mod tests {
                 epoll_mgr.clone(),
                 None,
                 None,
+                false,
             )
             .unwrap();
             dev.tap = None;
@@ -1083,6 +1114,7 @@ mod tests {
                 epoll_mgr,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1125,6 +1157,7 @@ mod tests {
             epoll_mgr,
             None,
             None,
+            false,
         )
         .unwrap();
 

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::{Config, NYDUS_FOR_KATA_TEE};
+use crate::runtime;
 use crate::runtime::containerd;
 use crate::utils;
 use crate::utils::toml as toml_utils;
@@ -11,6 +12,17 @@ use anyhow::Result;
 use log::{info, warn};
 use std::fs;
 use std::path::Path;
+
+fn erofs_default_size(mode: Option<&str>) -> Result<&'static str> {
+    match mode {
+        Some("memory") => Ok("\"0\""),
+        Some("disk") | None => Ok("\"10G\""),
+        Some(other) => Err(anyhow::anyhow!(
+            "Unsupported EROFS_SNAPSHOTTER_MODE: '{}'. Supported values: disk, memory",
+            other
+        )),
+    }
+}
 
 pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &Path) -> Result<()> {
     info!("Configuring erofs-snapshotter");
@@ -76,8 +88,7 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
 
     // dm-verity is orthogonal to rw-layer backing — it verifies lower (erofs)
     // layers via device-mapper regardless of whether the upper rw-layer lives on
-    // disk or in memory. When dm-verity is enabled, fsverity and immutable are
-    // disabled on the snapshotter side in favor of dm-verity.
+    // disk or in memory.
     let use_dmverity = config.erofs_dmverity;
     let dmverity_mode = if use_dmverity { "\"on\"" } else { "\"off\"" };
     let enable_dmverity = if use_dmverity { "true" } else { "false" };
@@ -116,10 +127,14 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
         "false",
     )?;
 
+    // Map EROFS_SNAPSHOTTER_MODE to containerd's default_size:
+    // - "memory" uses an in-memory rw layer (default_size = 0)
+    // - "disk" (or unset) uses a disk-backed rw layer (default_size = 10G)
+    let default_size = erofs_default_size(config.erofs_snapshotter_mode.as_deref())?;
     toml_utils::set_toml_value(
         configuration_file,
         ".plugins.\"io.containerd.snapshotter.v1.erofs\".default_size",
-        "\"10G\"",
+        default_size,
     )?;
     // In the default "merged" mode, force containerd to merge all layers into a
     // single fsmeta.erofs (max_unmerged_layers = 0). In "unmerged" mode we delete
@@ -202,14 +217,7 @@ pub async fn configure_snapshotter(
         containerd::pluginid_for_snapshotter_annotations(runtime_plugin_id, &paths.config_file)?;
 
     let configuration_file: std::path::PathBuf = if paths.use_drop_in {
-        // Only add /host prefix if path is not in /etc/containerd (which is mounted from host)
-        let base_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
-            Path::new(&paths.drop_in_file).to_path_buf()
-        } else {
-            // Need to add /host prefix for paths outside /etc/containerd
-            let drop_in_path = paths.drop_in_file.trim_start_matches('/');
-            Path::new("/host").join(drop_in_path)
-        };
+        let base_path = Path::new(&paths.drop_in_file).to_path_buf();
 
         log::debug!("Snapshotter using drop-in config file: {:?}", base_path);
         base_path
@@ -227,7 +235,7 @@ pub async fn configure_snapshotter(
                 _ => NYDUS_FOR_KATA_TEE.to_string(),
             };
 
-            utils::host_systemctl(&["restart", &nydus_snapshotter])?;
+            utils::host_systemctl(&["restart", &nydus_snapshotter]).await?;
         }
         "erofs" => {
             configure_erofs_snapshotter(config, &configuration_file).await?;
@@ -240,7 +248,7 @@ pub async fn configure_snapshotter(
     Ok(())
 }
 
-pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
+pub async fn install_nydus_snapshotter(config: &Config, runtime: &str) -> Result<()> {
     info!("Deploying {NYDUS_FOR_KATA_TEE}");
 
     let nydus_snapshotter = match config.multi_install_suffix.as_ref() {
@@ -249,7 +257,13 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
     };
 
     // Stop the service if it is currently running so we can replace the binaries safely.
-    let _ = utils::host_systemctl(&["stop", &format!("{nydus_snapshotter}.service")]);
+    let _ = utils::host_systemctl(&["stop", &format!("{nydus_snapshotter}.service")]).await;
+
+    // Disable it as well: the [Install] section we are about to write may name a
+    // different CRI unit than the one currently installed (e.g. after a kata-deploy
+    // upgrade), and `systemctl disable` is the only thing that removes the stale
+    // <old-cri-unit>.service.wants/ symlink.
+    let _ = utils::host_systemctl(&["disable", &format!("{nydus_snapshotter}.service")]).await;
 
     // The nydus data directory (/var/lib/nydus-for-kata-tee) is intentionally preserved
     // across reinstalls.  Removing it would create a split-brain state: the nydus backend
@@ -290,10 +304,7 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
         "@NYDUS_OVERLAYFS_PATH@",
         &format!(
             "{}/{NYDUS_FOR_KATA_TEE}/nydus-overlayfs",
-            &config
-                .host_install_dir
-                .strip_prefix("/host")
-                .unwrap_or(&config.host_install_dir)
+            &config.host_install_dir
         ),
     );
 
@@ -302,22 +313,21 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
         "@CONTAINERD_NYDUS_GRPC_BINARY@",
         &format!(
             "{}/{NYDUS_FOR_KATA_TEE}/containerd-nydus-grpc",
-            &config
-                .host_install_dir
-                .strip_prefix("/host")
-                .unwrap_or(&config.host_install_dir)
+            &config.host_install_dir
         ),
     );
     service_content = service_content.replace(
         "@CONFIG_GUEST_PULLING@",
         &format!(
             "{}/{NYDUS_FOR_KATA_TEE}/config-guest-pulling.toml",
-            &config
-                .host_install_dir
-                .strip_prefix("/host")
-                .unwrap_or(&config.host_install_dir)
+            &config.host_install_dir
         ),
     );
+
+    // Hook the snapshotter onto whichever unit actually runs containerd on this node.
+    let cri_service = runtime::cri_systemd_unit(runtime);
+    info!("Binding {nydus_snapshotter}.service to {cri_service}");
+    service_content = service_content.replace("@CRI_SERVICE@", &cri_service);
 
     fs::create_dir_all(format!("{}/{NYDUS_FOR_KATA_TEE}", config.host_install_dir))?;
 
@@ -363,12 +373,12 @@ pub async fn install_nydus_snapshotter(config: &Config) -> Result<()> {
     )?;
 
     fs::write(
-        format!("/host/etc/systemd/system/{nydus_snapshotter}.service"),
+        format!("/etc/systemd/system/{nydus_snapshotter}.service"),
         service_content,
     )?;
 
-    utils::host_systemctl(&["daemon-reload"])?;
-    utils::host_systemctl(&["enable", &format!("{nydus_snapshotter}.service")])?;
+    utils::host_systemctl(&["daemon-reload"]).await?;
+    utils::host_systemctl(&["enable", &format!("{nydus_snapshotter}.service")]).await?;
 
     Ok(())
 }
@@ -381,12 +391,12 @@ pub async fn uninstall_nydus_snapshotter(config: &Config) -> Result<()> {
         _ => NYDUS_FOR_KATA_TEE.to_string(),
     };
 
-    utils::host_systemctl(&["disable", "--now", &format!("{nydus_snapshotter}.service")])?;
-
-    fs::remove_file(format!(
-        "/host/etc/systemd/system/{nydus_snapshotter}.service"
-    ))
-    .ok();
+    let service = format!("/etc/systemd/system/{nydus_snapshotter}.service");
+    if Path::new(&service).exists() {
+        utils::host_systemctl(&["disable", "--now", &format!("{nydus_snapshotter}.service")])
+            .await?;
+        fs::remove_file(service).ok();
+    }
     fs::remove_dir_all(format!("{}/{NYDUS_FOR_KATA_TEE}", config.host_install_dir)).ok();
 
     // The nydus data directory (/var/lib/nydus-for-kata-tee) is intentionally preserved.
@@ -397,18 +407,18 @@ pub async fn uninstall_nydus_snapshotter(config: &Config) -> Result<()> {
     // snapshot records in meta.db are completely dormant — nothing will use them.  If nydus
     // is reinstalled later the data directory is still present and both sides remain in sync.
 
-    utils::host_systemctl(&["daemon-reload"])?;
+    utils::host_systemctl(&["daemon-reload"]).await?;
 
     Ok(())
 }
 
-pub async fn install_snapshotter(snapshotter: &str, config: &Config) -> Result<()> {
+pub async fn install_snapshotter(snapshotter: &str, config: &Config, runtime: &str) -> Result<()> {
     match snapshotter {
         "erofs" => {
             // erofs is a containerd built-in snapshotter, no installation needed
         }
         "nydus" => {
-            install_nydus_snapshotter(config).await?;
+            install_nydus_snapshotter(config, runtime).await?;
         }
         _ => {
             return Err(anyhow::anyhow!("Unsupported snapshotter: {snapshotter}"));
@@ -429,4 +439,26 @@ pub async fn uninstall_snapshotter(snapshotter: &str, config: &Config) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::erofs_default_size;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(None, "\"10G\"")]
+    #[case(Some("disk"), "\"10G\"")]
+    #[case(Some("memory"), "\"0\"")]
+    fn test_erofs_default_size(#[case] mode: Option<&str>, #[case] expected: &str) {
+        assert_eq!(erofs_default_size(mode).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_erofs_default_size_rejects_unknown_mode() {
+        let error = erofs_default_size(Some("unknown")).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Unsupported EROFS_SNAPSHOTTER_MODE"));
+    }
 }

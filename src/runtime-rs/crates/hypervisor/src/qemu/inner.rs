@@ -17,24 +17,25 @@ use crate::{
 
 use crate::utils::{
     bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
-    set_groups, uses_native_ccw_bus, vm_cleanup,
+    set_process_credentials, uses_native_ccw_bus, vm_cleanup,
 };
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::netns::NetnsGuard;
-use kata_types::build_path;
 use kata_types::config::hypervisor::{RootlessUser, VIRTIO_BLK_CCW, VIRTIO_BLK_PCI};
+use kata_types::prefix_with_rootless_dir;
 use kata_types::rootless::is_rootless;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
     config::KATA_PATH,
 };
-use nix::unistd::{setgid, setuid, Gid, Uid};
 use persist::sandbox_persist::Persist;
 use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -51,6 +52,7 @@ use tokio::{
 };
 
 const VSOCK_SCHEME: &str = "vsock";
+const MEMLOCK_HEADROOM_DIVISOR: u64 = 10;
 
 #[derive(Debug)]
 pub struct QemuInner {
@@ -98,7 +100,8 @@ impl QemuInner {
             }
         }
 
-        let vm_path = Path::new(build_path(KATA_PATH).as_str()).join(self.id.as_str());
+        let vm_path =
+            Path::new(prefix_with_rootless_dir(KATA_PATH).as_str()).join(self.id.as_str());
         create_dir_all_with_inherit_owner(vm_path, 0o750)?;
 
         Ok(())
@@ -107,6 +110,14 @@ impl QemuInner {
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "Starting QEMU VM");
         let netns = self.netns.clone().unwrap_or_default();
+
+        // Create the runtime directory (side-effect of get_jailer_root) before
+        // QemuCmdLine::new() binds qmp.sock inside it. With shared_fs=none,
+        // prepare_before_start_vm() never calls get_jailer_root(), so it must
+        // be done here explicitly. In rootless mode the path is under XDG_RUNTIME_DIR.
+        let jailer_root = self.get_jailer_root().await?;
+
+        check_bpf_enabled(self.config.security_info.seccomp_sandbox.as_deref());
 
         // CAUTION: since 'cmdline' contains file descriptors that have to stay
         // open until spawn() is called to launch qemu later in this function,
@@ -136,6 +147,7 @@ impl QemuInner {
                     let (
                         device_id,
                         path_on_host,
+                        vmdk,
                         is_direct,
                         is_readonly,
                         discard_unmap,
@@ -148,6 +160,7 @@ impl QemuInner {
                         (
                             device_id,
                             cfg.path_on_host.clone(),
+                            cfg.vmdk.clone(),
                             cfg.is_direct
                                 .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
                             cfg.is_readonly,
@@ -163,10 +176,7 @@ impl QemuInner {
                         continue;
                     }
                     match driver_option.as_str() {
-                        KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(
-                            &path_on_host,
-                            is_readonly,
-                        )?,
+                        KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(&path_on_host, is_readonly)?,
                         KATA_CCW_DEV_TYPE | KATA_BLK_DEV_TYPE | KATA_SCSI_DEV_TYPE => {
                             let serial = if serial_override.is_empty() {
                                 None
@@ -176,7 +186,9 @@ impl QemuInner {
                             cmdline.add_block_device(
                                 device_id.as_str(),
                                 &path_on_host,
+                                vmdk.as_ref(),
                                 is_direct,
+                                is_readonly,
                                 driver_option.as_str() == KATA_SCSI_DEV_TYPE,
                                 discard_unmap,
                                 serial,
@@ -235,21 +247,27 @@ impl QemuInner {
                 }
                 DeviceType::VfioModern(vfio_dev) => {
                     // Snapshot parameters under the lock; release before doing cmdline work.
-                    let (device_type, ap_sysfs_path, devices, bus_port_id) = {
+                    let (vfio_device_id, device_type, ap_sysfs_path, devices, iommufd, bus_port_id) = {
                         let vfio_device = vfio_dev.lock().await;
+                        let vfio_device_id = vfio_device.device_id.clone();
                         let device_type = vfio_device.device.device_type.clone();
                         let ap_sysfs_path =
                             vfio_device.device.primary.sysfs_path.display().to_string();
+                        // Legacy path: take devices from the IOMMU group.
+                        // IOMMUFD path: iommu_group is None; fall back to
+                        // VfioDevice::devices which holds the single cdev device.
                         let devices = vfio_device
                             .device
                             .iommu_group
                             .as_ref()
-                            .map(|g| g.clone().devices)
-                            .unwrap_or_default();
+                            .map(|g| g.devices.clone())
+                            .unwrap_or_else(|| vfio_device.device.devices.clone());
                         (
+                            vfio_device_id,
                             device_type,
                             ap_sysfs_path,
                             devices,
+                            vfio_device.device.iommufd.clone(),
                             vfio_device.config.bus_port_id.clone(),
                         )
                     };
@@ -264,15 +282,24 @@ impl QemuInner {
                         );
                     } else {
                         // PCI cold plug devices
-                        for dev in devices.iter() {
+                        for (index, dev) in devices.iter().enumerate() {
                             let host_bdf = dev.addr.to_string();
 
-                            let vfio_cfg = VfioDeviceConfig::new(
+                            let mut vfio_cfg = VfioDeviceConfig::new(
                                 host_bdf,
                                 bus_port_id.1 as u16,
                                 bus_port_id.1 + 1,
                             )
                             .with_vfio_bus(bus_port_id.0.clone());
+                            if let (Some(iommufd), Some(cdev)) =
+                                (iommufd.as_ref(), dev.vfio_cdev.as_ref())
+                            {
+                                vfio_cfg = vfio_cfg.with_device_fds(
+                                    &iommufd.iommufd_dev,
+                                    &cdev.devnode,
+                                    format!("vfio-{vfio_device_id}-{index}"),
+                                );
+                            }
 
                             cmdline.add_pcie_vfio_device(vfio_cfg)?;
                         }
@@ -358,12 +385,19 @@ impl QemuInner {
         //cmdline.add_serial_console("/dev/pts/23");
 
         // Add a console to the devices of the cmdline
-        let console_socket_path = Path::new(&self.get_jailer_root().await?).join("console.sock");
+        let console_socket_path = Path::new(&jailer_root).join("console.sock");
         cmdline.add_console(console_socket_path.to_str().unwrap());
 
-        info!(sl!(), "qemu args: {}", cmdline.build().await?.join(" "));
+        let qemu_args = cmdline.build().await?;
+        info!(sl!(), "qemu args: {}", qemu_args.join(" "));
         let mut command = Command::new(&self.config.path);
-        command.args(cmdline.build().await?);
+        command.args(qemu_args);
+        let ccw_subchannel = cmdline.take_ccw_subchannel();
+        let block_fdsets = cmdline.take_block_fdsets();
+        let has_memory_hotplug_region = cmdline.has_memory_hotplug_region();
+        let memlock_limit = cmdline.requires_memlock().then(|| {
+            memlock_limit_with_headroom(megs_to_bytes(self.config.memory_info.default_memory))
+        });
 
         info!(sl!(), "qemu cmd: {:?}", command);
 
@@ -399,13 +433,12 @@ impl QemuInner {
                     }
                 }
                 if let Some(user) = &user {
-                    let groups = user.groups.clone();
-                    let gid = Gid::from_raw(user.gid);
-                    let uid = Uid::from_raw(user.uid);
-
-                    let _ = set_groups(&groups);
-                    let _ = setgid(gid).context("setgid failed");
-                    let _ = setuid(uid).context("setuid failed");
+                    if let Some(limit) = memlock_limit {
+                        set_memlock_rlimit(limit)
+                            .map_err(|err| io::Error::other(format!("{err:#}")))?;
+                    }
+                    set_process_credentials(user)
+                        .map_err(|err| io::Error::other(format!("{err:#}")))?;
                 }
 
                 Ok(())
@@ -413,6 +446,9 @@ impl QemuInner {
         }
 
         let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
+        // QEMU inherited its startup descriptors during spawn. Drop the
+        // privileged shim's copies immediately; QEMU owns the fdsets from here.
+        drop(cmdline);
         let stderr = qemu_process.stderr.take().unwrap();
         self.qemu_process = Mutex::new(Some(qemu_process));
 
@@ -425,13 +461,26 @@ impl QemuInner {
 
         tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
+        // When hypervisor debug is enabled, output the kernel boot messages for debugging.
+        if self.config.debug_info.enable_debug {
+            tokio::spawn(async move {
+                let stream_result = try_open_qemu_console(&console_socket_path).await;
+                if let Ok(stream) = stream_result {
+                    if let Err(err) = log_qemu_console(stream).await {
+                        warn!(sl!(), "error logging qemu console: {:?}", err);
+                    }
+                }
+            });
+        }
+
         let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
 
         match Qmp::new(&qmp_socket_path) {
             Ok(mut qmp) => {
-                if let Some(subchannel) = cmdline.take_ccw_subchannel() {
+                if let Some(subchannel) = ccw_subchannel {
                     qmp.set_ccw_subchannel(subchannel);
                 }
+                qmp.verify_block_fdsets(block_fdsets)?;
                 // Setup virtio-mem device if enabled.  It requires a memory
                 // hotplug region (maxmem) on the QEMU command line; that region
                 // is not reserved for every configuration (e.g. on s390x the
@@ -442,7 +491,7 @@ impl QemuInner {
                 // boot memory -- instead of failing VM start with
                 // "the configuration is not prepared for memory devices".
                 if self.config.memory_info.enable_virtio_mem {
-                    if cmdline.has_memory_hotplug_region() {
+                    if has_memory_hotplug_region {
                         qmp.setup_virtio_mem(
                             self.config.memory_info.default_memory,
                             self.config.memory_info.default_maxmemory,
@@ -475,12 +524,6 @@ impl QemuInner {
                 .await
                 .context("boot from template")?;
             self.resume_vm().context("resume vm")?;
-        }
-
-        // When hypervisor debug is enabled, output the kernel boot messages for debugging.
-        if self.config.debug_info.enable_debug {
-            let stream = UnixStream::connect(console_socket_path.as_os_str()).await?;
-            tokio::spawn(log_qemu_console(stream));
         }
 
         Ok(())
@@ -693,7 +736,11 @@ impl QemuInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "QemuInner::cleanup()");
-        let vm_path = [build_path(KATA_PATH).as_str(), self.id.as_str()].join("/");
+        let vm_path = [
+            prefix_with_rootless_dir(KATA_PATH).as_str(),
+            self.id.as_str(),
+        ]
+        .join("/");
         vm_cleanup(&self.config, vm_path.as_str())
     }
 
@@ -766,11 +813,13 @@ impl QemuInner {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
                 | CapabilityBits::BlockDeviceDiscardSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         } else {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
                 | CapabilityBits::BlockDeviceDiscardSupport
                 | CapabilityBits::FsSharingSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         };
         caps.set(flags);
 
@@ -943,6 +992,96 @@ impl QemuInner {
     }
 }
 
+const BPF_JIT_ENABLE_PATH: &str = "/proc/sys/net/core/bpf_jit_enable";
+
+fn check_bpf_enabled(seccomp_sandbox: Option<&str>) {
+    check_bpf_enabled_with(
+        seccomp_sandbox,
+        || fs::read_to_string(BPF_JIT_ENABLE_PATH),
+        |message| warn!(sl!(), "{}", message),
+    );
+}
+
+fn check_bpf_enabled_with<ReadStatus, LogWarning>(
+    seccomp_sandbox: Option<&str>,
+    read_status: ReadStatus,
+    mut log_warning: LogWarning,
+) where
+    ReadStatus: FnOnce() -> io::Result<String>,
+    LogWarning: FnMut(String),
+{
+    if seccomp_sandbox.unwrap_or_default().is_empty() {
+        return;
+    }
+
+    let status = match read_status() {
+        Ok(status) => status,
+        Err(err) => {
+            log_warning(format!("failed to get bpf_jit_enable status: {err}"));
+            return;
+        }
+    };
+
+    let enabled = match status.trim().parse::<i32>() {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            log_warning(format!(
+                "failed to convert bpf_jit_enable status to integer: {err}"
+            ));
+            return;
+        }
+    };
+
+    if enabled == 0 {
+        log_warning(
+            "bpf_jit_enable is disabled. It's recommended to turn on bpf_jit_enable to reduce the performance impact of QEMU seccomp sandbox."
+                .to_string(),
+        );
+    }
+}
+
+fn memlock_limit_with_headroom(guest_memory: u64) -> u64 {
+    guest_memory.saturating_add(guest_memory / MEMLOCK_HEADROOM_DIVISOR)
+}
+
+fn set_memlock_rlimit(memlock_limit: u64) -> Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: memlock_limit,
+        rlim_max: memlock_limit,
+    };
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("set RLIMIT_MEMLOCK failed");
+    }
+    Ok(())
+}
+
+async fn try_open_qemu_console(console_socket_path: &Path) -> Result<UnixStream> {
+    const DEADLINE_SECS: u64 = 5;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(DEADLINE_SECS))
+        .ok_or_else(|| anyhow!("timeout overflow"))?;
+    let console_stream = loop {
+        match UnixStream::connect(console_socket_path.as_os_str()).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    warn!(
+                        sl!(),
+                        "couldn't open qemu console at {:#?} in {} seconds: {}",
+                        console_socket_path,
+                        DEADLINE_SECS,
+                        err
+                    );
+                    return Err(anyhow!("couldn't open qemu console: {err}"));
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        };
+    };
+    Ok(console_stream)
+}
+
 async fn log_qemu_console(console: UnixStream) -> Result<()> {
     info!(sl!(), "starting reading qemu console");
 
@@ -1112,7 +1251,7 @@ impl QemuInner {
                     is_direct,
                     is_readonly,
                     no_drop,
-                    block_format,
+                    vmdk,
                     discard_unmap,
                     driver,
                     logical_sector_size,
@@ -1129,7 +1268,7 @@ impl QemuInner {
                         ),
                         cfg.is_readonly,
                         cfg.no_drop,
-                        cfg.format.clone(),
+                        cfg.vmdk.clone(),
                         cfg.discard_unmap,
                         self.config.blockdev_info.block_device_driver.clone(),
                         cfg.logical_sector_size,
@@ -1166,7 +1305,7 @@ impl QemuInner {
                         discard_unmap,
                         logical_sector_size,
                         physical_sector_size,
-                        &block_format,
+                        vmdk.as_ref(),
                         iothread,
                     )
                     .context("hotplug block device")?;
@@ -1203,13 +1342,15 @@ impl QemuInner {
                     let (address, driver_type, bus) = if device_type == VfioDeviceType::MediatedAp {
                         (String::new(), "vfio-ap".to_string(), String::new())
                     } else {
-                        // FIXME: The first device in the group might not be the actual device intended for passthrough.
-                        // Multi-function support is tracked via issue #11292.
+                        // Legacy path: primary comes from the IOMMU group.
+                        // IOMMUFD path: iommu_group is None; use VfioDevice::primary
+                        // which is the single device returned by discover_vfio_device.
+                        // FIXME: multi-function group support tracked in #11292.
                         let primary_device = device
-                            .clone()
                             .iommu_group
-                            .ok_or_else(|| anyhow!("IOMMU group missing for VFIO device"))?
-                            .primary;
+                            .as_ref()
+                            .map(|g| g.primary.clone())
+                            .unwrap_or_else(|| device.primary.clone());
 
                         info!(
                             sl!(),
@@ -1327,5 +1468,79 @@ impl Persist for QemuInner {
 
             exit_notify: Some(exit_notify),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use rstest::rstest;
+
+    #[tokio::test]
+    async fn test_network_device_hotplug_capability() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        assert!(qemu
+            .capabilities()
+            .await
+            .unwrap()
+            .is_network_device_hotplug_supported());
+    }
+
+    #[test]
+    fn test_memlock_limit_adds_headroom() {
+        assert_eq!(memlock_limit_with_headroom(10 * 1024), 11 * 1024);
+        assert_eq!(memlock_limit_with_headroom(u64::MAX), u64::MAX);
+    }
+
+    #[rstest]
+    #[case::seccomp_sandbox_unset(None, Err(io::ErrorKind::NotFound), false, None)]
+    #[case::seccomp_sandbox_empty(Some(""), Err(io::ErrorKind::NotFound), false, None)]
+    #[case::read_failure(
+        Some("on"),
+        Err(io::ErrorKind::NotFound),
+        true,
+        Some("failed to get bpf_jit_enable status")
+    )]
+    #[case::parse_failure(
+        Some("on"),
+        Ok("invalid"),
+        true,
+        Some("failed to convert bpf_jit_enable status to integer")
+    )]
+    #[case::disabled(Some("on"), Ok("0\n"), true, Some("bpf_jit_enable is disabled"))]
+    #[case::enabled(Some("on"), Ok("1\n"), true, None)]
+    fn test_bpf_jit_check_warnings(
+        #[case] seccomp_sandbox: Option<&str>,
+        #[case] read_result: Result<&str, io::ErrorKind>,
+        #[case] expect_read: bool,
+        #[case] expected_warning: Option<&str>,
+    ) {
+        let read_called = Cell::new(false);
+        let warnings = RefCell::new(Vec::new());
+        check_bpf_enabled_with(
+            seccomp_sandbox,
+            || {
+                read_called.set(true);
+                read_result
+                    .map(str::to_owned)
+                    .map_err(|kind| io::Error::new(kind, "injected"))
+            },
+            |warning| warnings.borrow_mut().push(warning),
+        );
+
+        assert_eq!(read_called.get(), expect_read);
+
+        let warnings = warnings.borrow();
+        match expected_warning {
+            Some(expected) => {
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains(expected));
+            }
+            None => assert!(warnings.is_empty()),
+        }
     }
 }

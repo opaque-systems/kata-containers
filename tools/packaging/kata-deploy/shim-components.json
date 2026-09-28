@@ -13,39 +13,40 @@
     "qemu-runtime-rs": {
       "x86_64":  ["shim-v2-rust", "qemu", "virtiofsd", "nydus", "kernel", "kernel-debug", "rootfs-image", "rootfs-initrd"],
       "aarch64": ["shim-v2-rust", "qemu", "virtiofsd", "nydus", "kernel", "kernel-debug", "rootfs-image", "rootfs-initrd", "ovmf"],
-      "s390x":   ["shim-v2-rust", "qemu", "virtiofsd", "kernel", "rootfs-image", "rootfs-initrd"]
+      "s390x":   ["shim-v2-rust", "qemu", "virtiofsd", "kernel", "rootfs-image", "rootfs-initrd"],
+      "ppc64le": ["shim-v2-rust", "qemu", "virtiofsd", "kernel", "rootfs-initrd"]
     },
     "qemu-snp": {
-      "x86_64": ["shim-v2-go", "qemu-snp-experimental", "kernel", "rootfs-image-confidential", "ovmf-sev"]
+      "x86_64": ["shim-v2-go", "qemu", "kernel", "rootfs-image-confidential", "ovmf-sev"]
     },
     "qemu-snp-runtime-rs": {
-      "x86_64": ["shim-v2-rust", "qemu-snp-experimental", "kernel", "rootfs-image", "rootfs-image-coco-extension", "ovmf-sev"]
+      "x86_64": ["shim-v2-rust", "qemu", "kernel", "rootfs-image", "rootfs-image-coco-extension", "ovmf-sev"]
     },
     "qemu-tdx": {
-      "x86_64": ["shim-v2-go", "qemu-tdx-experimental", "kernel", "rootfs-image-confidential", "ovmf-tdx"]
+      "x86_64": ["shim-v2-go", "qemu", "kernel", "rootfs-image-confidential", "ovmf-tdx"]
     },
     "qemu-tdx-runtime-rs": {
-      "x86_64": ["shim-v2-rust", "qemu-tdx-experimental", "virtiofsd", "kernel", "rootfs-image", "rootfs-image-coco-extension", "ovmf-tdx"]
+      "x86_64": ["shim-v2-rust", "qemu", "kernel", "rootfs-image", "rootfs-image-coco-extension", "ovmf-tdx"]
     },
     "qemu-se": {
       "s390x": ["shim-v2-go", "qemu", "virtiofsd", "kernel", "rootfs-initrd-confidential", "boot-image-se"]
     },
     "qemu-se-runtime-rs": {
-      "s390x": ["shim-v2-rust", "qemu", "virtiofsd", "kernel", "rootfs-initrd-confidential", "boot-image-se"]
+      "s390x": ["shim-v2-rust", "qemu", "virtiofsd", "kernel", "rootfs-initrd", "rootfs-image-coco-extension", "boot-image-se-runtime-rs"]
     },
     "qemu-nvidia-gpu": {
       "x86_64": ["shim-v2-go", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia-gpu", "ovmf"]
     },
     "qemu-nvidia-gpu-runtime-rs": {
-      "x86_64":  ["shim-v2-rust", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia", "rootfs-image-nvidia-gpu-extension", "ovmf"]
+      "x86_64":  ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia", "rootfs-image-nvidia-gpu-extension", "ovmf"]
     },
     "qemu-nvidia-cpu": {
       "x86_64": ["shim-v2-go", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia"],
       "aarch64": ["shim-v2-go", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia"]
     },
     "qemu-nvidia-cpu-runtime-rs": {
-      "x86_64":  ["shim-v2-rust", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia"],
-      "aarch64": ["shim-v2-rust", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia"]
+      "x86_64":  ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia"],
+      "aarch64": ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia"]
     },
     "qemu-nvidia-gpu-snp": {
       "x86_64": ["shim-v2-go", "qemu-snp-experimental", "kernel-nvidia-gpu", "rootfs-image-nvidia-gpu-confidential", "ovmf-sev"]
@@ -81,6 +82,9 @@
     },
     "clh-azure-runtime-rs": {
       "x86_64": ["shim-v2-rust", "cloud-hypervisor", "virtiofsd", "kernel", "kernel-debug", "rootfs-image-mariner"]
+    },
+    "openvmm-azure-runtime-rs": {
+      "x86_64": ["shim-v2-rust", "openvmm", "virtiofsd", "kernel", "kernel-debug", "rootfs-image-mariner"]
     },
     "dragonball": {
       "x86_64":  ["shim-v2-rust", "virtiofsd", "nydus", "kernel-dragonball-experimental", "rootfs-image", "rootfs-initrd"],

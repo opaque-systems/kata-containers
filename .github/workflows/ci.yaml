@@ -259,6 +259,7 @@ jobs:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -355,14 +356,17 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
 
-  run-k8s-tests-on-arm64:
+  run-k8s-tests-crio:
     if: ${{ inputs.skip-test != 'yes' }}
-    needs: publish-kata-deploy-image-arm64
-    uses: ./.github/workflows/run-k8s-tests-on-arm64.yaml
+    needs: publish-kata-deploy-image-amd64
+    permissions:
+      contents: read
+    uses: ./.github/workflows/run-k8s-tests-crio.yaml
     with:
+      tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
       repo: ${{ github.repository_owner }}/kata-deploy-ci
-      tag: ${{ inputs.tag }}-arm64
+      tag: ${{ inputs.tag }}-amd64
       commit-hash: ${{ inputs.commit-hash }}
       pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
@@ -452,7 +456,7 @@ jobs:
       commit-hash: ${{ inputs.commit-hash }}
       pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
-      vmm: ${{ (inputs.pr-number == 'nightly' || inputs.pr-number == 'dev') && '["qemu", "qemu-runtime-rs", "qemu-coco-dev", "qemu-coco-dev-runtime-rs"]' || '["qemu", "qemu-runtime-rs", "qemu-coco-dev"]' }}
+      vmm: ${{ (inputs.pr-number == 'nightly' || inputs.pr-number == 'dev') && '["qemu", "qemu-runtime-rs", "qemu-coco-dev", "qemu-coco-dev-runtime-rs"]' || '["qemu", "qemu-runtime-rs", "qemu-coco-dev-runtime-rs"]' }}
     secrets:
       AUTHENTICATED_IMAGE_PASSWORD: ${{ secrets.AUTHENTICATED_IMAGE_PASSWORD }}
 
@@ -560,6 +564,7 @@ jobs:
       matrix:
         params: [
           {containerd_version: latest, vmm: qemu},
+          {containerd_version: latest, vmm: qemu-runtime-rs},
         ]
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-cri-ppc64le-${{ toJSON(matrix) }}

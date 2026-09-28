@@ -70,6 +70,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-zvsi-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: s390x-large
+    timeout-minutes: 90
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
@@ -134,7 +135,7 @@ jobs:
         if: ${{ startsWith(matrix.vmm, 'qemu-coco-dev') }}
 
       - name: Install `kbs-client`
-        timeout-minutes: 20
+        timeout-minutes: 10
         run: bash tests/integration/kubernetes/gha-run.sh install-kbs-client
         if: ${{ startsWith(matrix.vmm, 'qemu-coco-dev') }}
 

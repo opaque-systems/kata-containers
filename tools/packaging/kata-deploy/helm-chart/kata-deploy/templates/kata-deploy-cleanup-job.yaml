@@ -2,7 +2,7 @@
 Cleanup dispatcher (deploymentMode: job, pre-delete hook).
 
 The mirror image of the install dispatcher: a single tiny pre-delete hook Job that
-runs the dispatcher (kata-deploy-job-dispatcher) to fan out one node-pinned cleanup Job
+runs k8s-job-dispatcher to fan out one node-pinned cleanup Job
 per selected node, paced to job.parallelism. Each per-node Job runs the install
 pipeline in reverse and exits:
 
@@ -12,8 +12,10 @@ pipeline in reverse and exits:
 Unlike the old per-node hook model, node selection here is resolved LIVE when the
 hook runs at `helm uninstall` (the dispatcher does the lookup), not frozen at
 install/upgrade time. That is why the default cleanup selector can be
-"nodes carrying the katacontainers.io/kata-runtime label" (i.e. exactly the
-nodes install actually labeled) - see values.yaml job.cleanup.
+"nodes carrying the katacontainers.io/kata-runtime label", whatever its value:
+install claims a node with =false before writing to it and promotes it to =true
+once it is kata-capable, so this covers half-installed nodes too - see
+values.yaml job.cleanup.
 
 This runs while the release's kept ServiceAccount/RBAC and the job-templates
 ConfigMap still exist; they are torn down only after pre-delete hooks complete.
@@ -28,7 +30,7 @@ ConfigMap still exist; they are torn down only after pre-delete hooks complete.
 {{- $dispatcherName := printf "%s-cleanup-dispatcher" $base | trunc 63 | trimSuffix "-" }}
 {{- $cleanup := .Values.job.cleanup | default dict }}
 {{- $cNodes := $cleanup.nodes | default list }}
-{{- $cSelector := include "kata-deploy.nodeLabelSelector" (dict "eq" ($cleanup.nodeSelector | default dict) "exprs" ($cleanup.nodeSelectorExpressions | default list)) }}
+{{- $cSelectors := include "kata-deploy.cleanupNodeSelectors" . | splitList "\n" | compact }}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -43,6 +45,9 @@ metadata:
     "helm.sh/hook": pre-delete
     "helm.sh/hook-weight": "5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+{{- /* A failed uninstall leaves hosts half reverted, so the dispatcher's
+       account of them belongs in the `helm uninstall` output. */}}
+    "helm.sh/hook-output-log-policy": hook-failed
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: {{ $root.Values.job.ttlSecondsAfterFinished }}
@@ -67,9 +72,8 @@ spec:
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
-{{- with $root.Values.tolerations }}
-      tolerations:
-{{- toYaml . | nindent 8 }}
+{{- with include "kata-deploy.dispatcherPlacement" $root | trim }}
+{{- . | nindent 6 }}
 {{- end }}
 {{- with $root.Values.priorityClassName }}
       priorityClassName: {{ . | quote }}
@@ -78,6 +82,8 @@ spec:
         - name: dispatcher
           image: {{ include "kata-deploy.dispatcherImage" $root }}
           imagePullPolicy: {{ $root.Values.imagePullPolicy }}
+          {{- /* The dispatcher's last words are its per-node summary. */}}
+          terminationMessagePolicy: FallbackToLogsOnError
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -86,16 +92,27 @@ spec:
               drop:
                 - ALL
           command:
-            - /usr/bin/kata-deploy-job-dispatcher
+            - /usr/bin/k8s-job-dispatcher
             - "--job-template=/etc/kata-job/cleanup-job.yaml"
             - "--name-prefix={{ $base }}-cleanup"
             - "--owner-job-name={{ $dispatcherName }}"
             - "--parallelism={{ $root.Values.job.parallelism }}"
+{{- include "kata-deploy.dispatcherNodeWorkFlags" (dict "root" $root "stage" "cleanup") | nindent 12 }}
 {{- if $cNodes }}
             - "--nodes={{ join "," $cNodes }}"
-{{- else if $cSelector }}
-            - "--node-selector={{ $cSelector }}"
+{{- else }}
+{{- /* One flag per nodeSelectorTerm; the dispatcher unions the matches (OR). */}}
+{{- range $selector := $cSelectors }}
+            - "--node-selector={{ $selector }}"
 {{- end }}
+{{- end }}
+{{- /*
+  Uninstall must reach every node the install ever labeled, including any that
+  have since been tainted, so the dispatcher's DaemonSet-equivalent taint check
+  is disabled here. The per-node cleanup Jobs are pinned by nodeName and so are
+  admitted regardless of taints.
+*/}}
+            - "--ignore-node-taints"
           env:
             - name: POD_NAMESPACE
               valueFrom:

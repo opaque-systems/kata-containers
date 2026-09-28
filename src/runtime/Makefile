@@ -253,9 +253,9 @@ DEFGUESTSELINUXLABEL :=
 # More explanation on https://lists.gnu.org/archive/html/qemu-devel/2017-02/msg03348.html
 #
 # Default is empty string "" to match the default (when commented out in config).
-# Most users will want to set this to "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
-# for better security. Note: "elevateprivileges=deny" doesn't work with daemonize option.
-# Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
+# Most users will want to set this to
+# "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+# for better security.
 DEFSECCOMPSANDBOXPARAM :=
 
 #Default entropy source
@@ -502,9 +502,9 @@ ifneq (,$(QEMUCMD))
     # Best practice for production is to set this to true
     DEFSANDBOXCGROUPONLY_NV = true
 
-    DEFENABLEVCPUPINNING_NV = true
+    DEFENABLEVCPUPINNING_NV = false
 
-    DEFENABLENUMA_NV = true
+    DEFENABLENUMA_NV = false
 
     # NVIDIA profile: rootfs filesystem type (erofs for read-only, compressed images)
     DEFROOTFSTYPE_NV := $(ROOTFSTYPE_EROFS)
@@ -545,6 +545,8 @@ ifneq (,$(CLHCMD))
     CONFIGS += $(CONFIG_CLH_AZURE)
 
     # CLH-specific options (all should be suffixed by "_CLH")
+    DEFDISABLENESTEDVIRTUALIZATION_CLH := false
+    DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE := true
     # currently, huge pages are required for virtiofsd support
     DEFNETWORKMODEL_CLH := tcfilter
     IMAGEPATH_CLH_AZURE := $(PKGDATADIR)/kata-containers-mariner.img
@@ -769,6 +771,8 @@ USER_VARS += SHAREDIR
 USER_VARS += SYSCONFDIR
 USER_VARS += DEFVCPUS
 USER_VARS += DEFMAXVCPUS
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE
 USER_VARS += DEFMEMSZ
 USER_VARS += DEFMEMSLOTS
 USER_VARS += DEFMAXMEMSZ
@@ -849,20 +853,44 @@ QUIET_TEST     = $(Q:@=@echo    '     TEST     '$@;)
 
 BUILDTAGS :=
 
-# go build common flags
-BUILDFLAGS := -buildmode=pie ${BUILDTAGS}
-
-# Static build profile.
+# Static build profile (default on amd64, arm64 and riscv64; opt-in on
+# s390x and ppc64le).
 #
-# When STATIC=yes the Go host binaries (kata-runtime, containerd-shim-kata-v2
-# and kata-monitor) are built with cgo disabled and without PIE, producing
-# fully static, libc-agnostic executables. This lets the kata-deploy payload
-# run on musl-only hosts that have no glibc dynamic loader. It relies on the
-# runtime being cgo-free; the default (non-static) build is left unchanged.
+# The Go host binaries (kata-runtime, containerd-shim-kata-v2 and kata-monitor)
+# are built with cgo disabled and without PIE by default, producing fully
+# static, libc-agnostic executables. This lets the kata-deploy payload run on
+# musl-only hosts that have no glibc dynamic loader (e.g. Alpine, Kairos'
+# Hadron), in addition to the traditional glibc hosts. It relies on the runtime
+# being cgo-free.
+#
+# On s390x the profile stays opt-in because the KVM host process must be
+# marked with a PT_S390_PGSTE program header, which is emitted by ld's
+# --s390-pgste. Go only honours -extldflags when linkmode=external, and
+# linkmode=external requires cgo, so a cgo-free s390x build cannot carry the
+# marker with today's tooling. The default on s390x therefore stays cgo + PIE
+# until we have a way to produce a cgo-free static binary that still carries
+# the PGSTE program header.
+#
+# On ppc64le the profile also stays opt-in for now. The rest of the
+# kata-deploy payload on ppc64le is glibc-linked (musl is not well supported
+# on the arch, and upstream nydus-snapshotter publishes only per-arch glibc
+# release assets), so shipping a static Go runtime alone does not unlock
+# musl-only hosts. Keep the cgo + PIE build as the default until the ppc64le
+# payload story catches up and ppc64le maintainers confirm the flip.
+#
+# Set STATIC=no to opt out (on s390x and ppc64le this is the default).
+ifneq (,$(filter $(ARCH),s390x ppc64le))
+    STATIC ?= no
+else
+    STATIC ?= yes
+endif
+
 ifeq ($(STATIC),yes)
        export CGO_ENABLED := 0
        # PIE requires a dynamic loader, so it cannot be used for static binaries.
        BUILDFLAGS := ${BUILDTAGS}
+else
+       BUILDFLAGS := -buildmode=pie ${BUILDTAGS}
 endif
 
 # whether stipping the binary
@@ -870,6 +898,11 @@ ifeq ($(STRIP),yes)
        KATA_LDFLAGS = -w -s
 endif
 
+# On s390x the KVM host process must be marked with a PT_S390_PGSTE program
+# header so the kernel allocates PGSTE tables (required by KVM_CREATE_VM). The
+# marker is emitted by the external linker's --s390-pgste flag, which the
+# default cgo + PIE build (STATIC=no on s390x) drives through Go's external
+# linker path.
 ifeq ($(ARCH),s390x)
     KATA_LDFLAGS += -extldflags=-Wl,--s390-pgste
 endif

@@ -515,7 +515,7 @@ image unless placed there deliberately, and the NVIDIA base is never built with
 `CONFIDENTIAL_GUEST=yes`, so the same tools arrive as ordinary packages. In both
 cases the extension's `cryptsetup` resolves its libraries against the base, which
 requires the base and the coco-extension builder to stay on the **same distro/ABI**
-(Ubuntu 24.04 "noble" today).
+(Ubuntu 26.04 "resolute" today).
 
 ### Image build pipeline
 
@@ -568,27 +568,61 @@ arrive as packages — they are copied into the base layout explicitly:
 `veritysetup` and its library closure unconditionally, and the
 `mke2fs`/`mkfs.ext4`/`dd`/`mke2fs.conf` plain-storage tooling alongside it.
 
+#### CoCo guest components (monolithic confidential images)
+
+The Go runtime still boots a **monolithic** confidential image that bakes the
+CoCo guest components directly into the rootfs. Rather than compiling
+guest-components on the kata side, `install_coco_guest_components` pulls the
+scratch OCI **container** image guest-components publishes in the
+`coco-extension-image` workflow ("Publish OCI container image" step) at
+`ghcr.io/confidential-containers/guest-components/coco-extension`
+(`.externals.coco-guest-components.container_image`), verifies its provenance,
+and exports the filesystem into `kata-static-coco-guest-components.tar.zst`.
+This is distinct from the EROFS disk image (`extension_image`) used by the
+runtime-rs composable extension path. The container payload includes the
+guest-component binaries, `cryptsetup`, the pause bundle, and
+`etc/ocicrypt_config.json`, so confidential rootfs builds no longer need a
+separate `pause-image` tarball or a local guest-components compile.
+
 #### CoCo guest extension image
 
-The `kata-containers-coco-extension.img` is built by:
+The `kata-containers-coco-extension.img` is built and published by
+[guest-components](https://github.com/confidential-containers/guest-components)
+(`tools/coco-extension/`) as a multi-arch OCI index at
+`ghcr.io/confidential-containers/guest-components/coco-extension-disk`. Kata pins
+the guest-components revision in `versions.yaml` under
+`.externals.coco-guest-components` (`version`, `variant`, `container_image`, and
+`extension_image` must stay in sync) and, at build time, `install_image_coco_extension`:
 
-1. Unpacking the CoCo guest components tarball into a temporary rootfs. Besides
-   the agent-launched binaries (attestation-agent, attestation-agent-nv,
-   confidential-data-hub, api-server-rest) this tarball also carries:
-   - `cryptsetup` under `usr/sbin` — the encrypted-storage binary for CDH
-     `secure_mount` (its shared libraries are resolved against the base; see
-     "Runtime dependencies").
-   - the NVIDIA attester libraries under `usr/local/lib` — `libnvat.so` plus its
-     non-glibc transitive closure (libxml2, zlib, lzma, the C++ runtime).
-2. Unpacking the pause image tarball into the same rootfs.
-3. Writing the component manifest to `etc/kata-extensions/components.toml`.
-4. Running the image builder with:
-   - `FS_TYPE=erofs` — EROFS filesystem for compact, read-only storage.
-   - `MEASURED_ROOTFS=yes` — creates a dm-verity hash partition.
-   - `SKIP_DAX_HEADER=yes` — no DAX header (virtio-blk, not NVDIMM).
-   - `SKIP_ROOTFS_CHECK=yes` — the extension has no `/sbin/init`.
-   - `BUILD_VARIANT=coco-extension` — produces a correctly named root hash file
-     (`root_hash_coco-extension.txt`).
+1. Resolves the per-architecture manifest digest from the index
+   (`oras resolve --platform linux/<arch>`).
+2. Verifies the provenance attestation guest-components published for that digest
+   (`gh attestation verify --repo confidential-containers/guest-components
+   --bundle-from-oci`). On amd64/arm64 CI sets
+   `VERIFY_COCO_EXTENSION_PROVENANCE=yes` to require it when `GH_TOKEN` is
+   available; locally it is skipped when no GitHub token is set. s390x always
+   skips because the GitHub CLI ships no s390x build.
+3. Pulls that exact digest (`oras pull`) so the installed image is byte-for-byte
+   the artefact whose provenance was verified.
+
+!!! note
+    Provenance verification runs when `GH_TOKEN` or `GITHUB_TOKEN` is available
+    (CI forwards the runner token automatically). Local builds without a token
+    skip verification with a warning. Set `VERIFY_COCO_EXTENSION_PROVENANCE=yes`
+    to require it, or `no` to disable it explicitly.
+
+The guest-components build assembles a rootfs that carries the agent-launched
+binaries (attestation-agent, attestation-agent-nv, confidential-data-hub,
+api-server-rest), `cryptsetup` under `usr/sbin`, the NVIDIA attester libraries
+under `usr/local/lib`, the pause bundle, and the component manifest at
+`etc/kata-extensions/components.toml`, then formats it as:
+
+- `FS_TYPE=erofs` — EROFS filesystem for compact, read-only storage.
+- `MEASURED_ROOTFS=yes` — creates a dm-verity hash partition (except on s390x).
+- `SKIP_DAX_HEADER=yes` — no DAX header (virtio-blk, not NVDIMM).
+- `SKIP_ROOTFS_CHECK=yes` — the extension has no `/sbin/init`.
+- `BUILD_VARIANT=coco-extension` — produces a correctly named root hash file
+  (`root_hash_coco-extension.txt`).
 
 The resulting image is a two-partition disk:
 
@@ -612,6 +646,27 @@ Confidential Containers:
   measurement. An attacker cannot substitute different verity parameters
   without changing the measurement, which would be detected during
   attestation.
+
+- IBM Secure Execution achieves equivalent integrity through a different mechanism.
+  `genprotimg` seals the full kernel command line — including
+  `kata.extension.coco.verity_params=root_hash=...,salt=...,data_blocks=...,...`
+  — into the SE image header at build time, encrypted under the host key. The sealed
+  contents are integrity-protected and cannot be altered without rebuilding the image.
+  The build-time dependency on
+  `rootfs-image-coco-extension-tarball` ensures the root hash published at the
+  pinned `versions.yaml` commit is locked into the SE image at creation time.
+  Substituting the extension image at runtime would be detected by dm-verity verification
+  during boot.
+
+- **Unmeasured extensions** — when `kata.extension.coco.verity_params` carries no
+  value (a bare key), the mount script performs a raw mount without dm-verity
+  verification. This is the correct path when the extension image was intentionally
+  built without a hash partition (e.g. because the surrounding platform already
+  provides a different integrity guarantee). The mount script cross-checks the
+  cmdline against the on-disk partition layout to prevent a measured extension from
+  being silently downgraded: if a hash partition is present on disk but
+  `verity_params` is bare, the mount is refused and the VM shuts down. See the
+  [integrity policy table](#mount-script) above.
 
 - **Mount failure = VM shutdown** — `OnFailure=poweroff.target` ensures the
   VM does not proceed with missing or tampered components.
@@ -699,11 +754,11 @@ The architecture is designed to support multiple guest extension images:
 
 - **GPU extension** — the NVIDIA GPU userspace (driver libraries, NVML, the
   container-toolkit binaries, kernel modules) lives in a `gpu-extension` image
-  mounted at `/run/kata-extensions/gpu`, carved out of the same build as the
-  driver-agnostic `nvidia` base image. NVRC orchestrates early boot, loads the
-  modules from the extension, and composes the GPU extension with the CoCo extension on
-  confidential GPU guests. This extension is implemented; its interplay with the
-  CoCo extension (NVML resolution, attester selection) is covered in
+  mounted at `/run/kata-extensions/gpu`, assembled from the same pinned package
+  sources used by the monolith. NVRC orchestrates early boot, loads the modules
+  from the extension, and composes the GPU extension with the CoCo extension on
+  confidential GPU guests. This extension is implemented; its interplay with
+  the CoCo extension (NVML resolution, attester selection) is covered in
   "Runtime dependencies" and "Attester variant selection" above.
 
 - **Custom extensions** — users can build their own guest extension images for
@@ -711,19 +766,28 @@ The architecture is designed to support multiple guest extension images:
 
 ### Additive image assembly
 
-Today the NVIDIA images are carved out of a single chiseled monolith tree: the
-`gpu-extension` is assembled additively (an allow-list of GPU userspace is copied
-into a fresh tree), while the `nvidia` base is produced *subtractively* — the same
-allow-list is deleted from the full tree. This keeps the monolith byte-identical
-during the transition, but it means the base build describes what it does *not*
-want rather than what it does.
+The `gpu-extension` is assembled in a dedicated Ubuntu builder container. Its
+image build installs the same pinned NVIDIA packages from the same CUDA, tools,
+and Ubuntu repositories as the monolith, and bakes in the pinned UPX tool. It
+intentionally carries no Rust or Go toolchain. At runtime, the builder uses the
+driver's `sandboxutils-filelist.json` capability map to copy only the required
+GPU userspace into a fresh extension tree, then adds Kata's version-matched
+NVIDIA kernel modules from the kernel build artifact. This path needs no
+`mmdebstrap`, package-install chroot, agent artifact, NVRC artifact, or shared
+driver `stage-one`.
+
+The `nvidia` base is still produced *subtractively*: its GPU allow-list is
+deleted from the full chiseled monolith tree. This keeps the monolith
+byte-identical during the transition, but it means the base build describes what
+it does *not* want rather than what it does.
 
 The intended next step is to invert this into a purely additive flow, so nothing
 is ever subtracted:
 
-1. Build the shared driver `stage-one` (always required).
+1. Build the shared driver `stage-one` for the monolith and `nvidia` base.
 2. Assemble the `nvidia` base additively from `stage-one`.
-3. Assemble the `gpu-extension` additively from `stage-one`.
+3. Keep assembling the `gpu-extension` directly from the pinned package sources
+   and Kata kernel module artifact.
 4. Compose the monolith by combining the base and the extension.
 
 This requires splitting the interleaved `chisseled_*` producers (which today copy

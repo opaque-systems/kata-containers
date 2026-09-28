@@ -35,6 +35,7 @@ members = [
   "src/dragonball/crates/dbs_interrupt",
   "src/dragonball/crates/dbs_legacy_devices",
   "src/dragonball/crates/dbs_pci",
+  "src/dragonball/crates/dbs_snapshot",
   "src/dragonball/crates/dbs_upcall",
   "src/dragonball/crates/dbs_utils",
   "src/dragonball/crates/dbs_virtio_devices",
@@ -47,9 +48,6 @@ members = [
 
   # kata-deploy (Kubernetes installer binary)
   "tools/packaging/kata-deploy/binary",
-
-  # kata-deploy-job-dispatcher (generic per-node Job dispatcher)
-  "tools/packaging/kata-deploy/job-dispatcher",
 
   # runtime-rs
   "src/runtime-rs",
@@ -113,6 +111,7 @@ dbs-interrupt = { path = "src/dragonball/crates/dbs_interrupt" }
 dbs-legacy-devices = { path = "src/dragonball/crates/dbs_legacy_devices" }
 dbs-pci = { path = "src/dragonball/crates/dbs_pci" }
 dbs-upcall = { path = "src/dragonball/crates/dbs_upcall" }
+dbs-snapshot = { path = "src/dragonball/crates/dbs_snapshot" }
 dbs-utils = { path = "src/dragonball/crates/dbs_utils" }
 dbs-virtio-devices = { path = "src/dragonball/crates/dbs_virtio_devices" }
 
@@ -132,6 +131,7 @@ wasm_container = { path = "src/runtime-rs/crates/runtimes/wasm_container" }
 
 # Local dependencies from `src/lib`
 kata-sys-util = { path = "src/libs/kata-sys-util" }
+pcilibs-rs = { git = "https://github.com/kata-containers/pcilibs-rs", rev = "28308229" }
 pod-resources-rs = { path = "src/libs/pod-resources-rs" }
 kata-types = { path = "src/libs/kata-types", features = ["safe-path"] }
 logging = { path = "src/libs/logging" }
@@ -175,9 +175,9 @@ ipnetwork = "0.17.0"
 lazy_static = "1.4"
 libc = "0.2.94"
 log = "0.4.14"
-netlink-packet-core = "0.7.0"
-netlink-packet-route = "0.19.0"
-netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
+netlink-packet-core = "0.9.0"
+netlink-packet-route = "0.33.0"
+netlink-sys = { version = "0.9.0", features = ["tokio_socket"] }
 netns-rs = "0.1.0"
 # Note: nix needs to stay sync'd with libs versions
 nix = { version = "0.31.3", features = ["fs", "mount", "sched", "process", "ioctl", "signal", "socket", "feature", "user", "hostname", "term", "event", "mman", "reboot"] }
@@ -190,7 +190,7 @@ protobuf = "3.7.2"
 rand = "0.10.1"
 regex = "1.10.5"
 rstest = "0.26.1"
-rtnetlink = "0.14.0"
+rtnetlink = "0.23.0"
 scan_fmt = "0.2.6"
 scopeguard = "1.0.0"
 serde = { version = "1.0.145", features = ["derive"] }
@@ -205,6 +205,7 @@ slog-term = "2.9.0"
 strum = { version = "0.24.0", features = ["derive"] }
 strum_macros = "0.26.2"
 sysinfo = "0.39.5"
+tar = "0.4.46"
 tdx = "0.1.1"
 tempfile = "3.19.1"
 thiserror = "2.0.18"

@@ -211,6 +211,21 @@ function deploy_kata() {
 	if [[ "${KATA_HYPERVISOR}" = "qemu" ]]; then
 		ANNOTATIONS="image initrd kernel default_vcpus"
 	fi
+	if [[ "${KATA_HYPERVISOR}" = "clh-runtime-rs" ]]; then
+		ANNOTATIONS+=" cc_init_data"
+	fi
+	# The NVIDIA runtime classes ship with the hypervisor annotations disabled,
+	# so the ones a few tests depend on have to be opted into here.
+	if is_nvidia_hypervisor "${KATA_HYPERVISOR}" || is_confidential_gpu_hypervisor "${KATA_HYPERVISOR}"; then
+		if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
+			# k8s-confidential-attestation.bats and the NIM TEE pods pass the
+			# KBS address and the guest components setup on the kernel cmdline.
+			ANNOTATIONS+=" kernel_params"
+		elif is_verity_enabled_runtime_class "${KATA_HYPERVISOR}"; then
+			# k8s-measured-rootfs.bats corrupts the verity root hash.
+			ANNOTATIONS+=" kernel_verity_params"
+		fi
+	fi
 
 	SNAPSHOTTER_HANDLER_MAPPING=""
 	if [[ -n "${SNAPSHOTTER}" ]]; then
@@ -237,6 +252,19 @@ function deploy_kata() {
 	export HELM_IMAGE_REFERENCE="${DOCKER_REGISTRY}/${DOCKER_REPO}"
 	export HELM_IMAGE_TAG="${DOCKER_TAG}"
 	export HELM_DEBUG="true"
+	# Deploy the devkit debug extension for the (non-confidential) runtime-rs
+	# class that k8s-devkit-debug-console.bats exercises. Restricted to
+	# x86_64/aarch64: the devkit image and kata-ctl (its debug-console client)
+	# are not shipped on s390x/ppc64le, so devkit is neither built nor testable
+	# there.
+	export HELM_DEVKIT="false"
+	case "${TARGET_ARCH}" in
+		x86_64 | aarch64)
+			case "${KATA_HYPERVISOR}" in
+				qemu-nvidia-cpu-runtime-rs) export HELM_DEVKIT="true" ;;
+			esac
+			;;
+	esac
 	export HELM_SHIMS="${KATA_HYPERVISOR}"
 	export HELM_DEFAULT_SHIM="${KATA_HYPERVISOR}"
 	export HELM_CREATE_DEFAULT_RUNTIME_CLASS="true"
@@ -471,7 +499,7 @@ function main() {
 	if [[ -z "${AUTO_GENERATE_POLICY}" ]]; then
 		# https://github.com/kata-containers/kata-containers/issues/12839
 		if [[ "${KATA_HOST_OS}" = "cbl-mariner" && \
-			  "${KATA_HYPERVISOR}" = "clh" ]]; then
+			  "${KATA_HYPERVISOR}" =~ ^clh(-azure)?$ ]]; then
 			AUTO_GENERATE_POLICY="yes"
 		elif [[ "${KATA_HYPERVISOR}" = qemu-coco-dev* && \
 		        ( "${TARGET_ARCH}" = "x86_64" || "${TARGET_ARCH}" = "aarch64" ) && \
@@ -491,6 +519,7 @@ function main() {
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
+		setup-crio) setup_crio ;;
 		deploy-coco-kbs) deploy_coco_kbs ;;
 		deploy-k8s) deploy_k8s "${CONTAINER_ENGINE:-}" "${CONTAINER_ENGINE_VERSION:-}";;
 		install-bats) install_bats ;;

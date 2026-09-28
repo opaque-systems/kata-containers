@@ -12,15 +12,12 @@ use std::{
 };
 
 use crate::{
+    block_device::agent_storage_source_from_block_config,
     share_fs::{do_get_guest_path, do_get_host_path},
     volume::share_fs_volume::generate_mount_path,
 };
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{get_mount_options, get_mount_path};
-use kata_types::device::{
-    DRIVER_BLK_CCW_TYPE as KATA_CCW_DEV_TYPE, DRIVER_BLK_PCI_TYPE as KATA_BLK_DEV_TYPE,
-    DRIVER_SCSI_TYPE as KATA_SCSI_DEV_TYPE,
-};
 use oci_spec::runtime as oci;
 
 use hypervisor::device::DeviceType;
@@ -103,7 +100,6 @@ pub fn get_file_name<P: AsRef<Path>>(src: P) -> Result<String> {
 
 pub(crate) async fn generate_shared_path(
     dest: PathBuf,
-    read_only: bool,
     device_id: &str,
     sid: &str,
 ) -> Result<String> {
@@ -112,7 +108,7 @@ pub(crate) async fn generate_shared_path(
     let guest_path = do_get_guest_path(&mount_name, device_id, true, false);
     // Note: directories should always be created under the rw/ path. The ro/ directory is a
     // read-only bind mount of rw/, so creating directories directly under ro/ would fail with a read-only FS.
-    let host_path = do_get_host_path(&mount_name, sid, device_id, true, read_only);
+    let host_path = do_get_host_path(&mount_name, sid, device_id, true, false);
 
     if get_mount_path(&Some(dest)).starts_with("/dev") {
         fs::File::create(&host_path).context(format!("failed to create file {:?}", &host_path))?;
@@ -122,44 +118,6 @@ pub(crate) async fn generate_shared_path(
     }
 
     Ok(guest_path)
-}
-
-/// Extract storage source information from block device configuration.
-/// This helper function handles the common logic for determining the storage source
-/// based on the driver type (BLK/SCSI/CCW).
-fn extract_storage_source(
-    driver_option: &str,
-    pci_path: Option<&hypervisor::device::pci_path::PciPath>,
-    scsi_addr: Option<&str>,
-    ccw_addr: Option<&str>,
-    virt_path: &str,
-) -> Result<String> {
-    let source = match driver_option {
-        KATA_BLK_DEV_TYPE => {
-            if let Some(pci_path) = pci_path {
-                pci_path.to_string()
-            } else {
-                return Err(anyhow!("block driver is blk but no pci path exists"));
-            }
-        }
-        KATA_SCSI_DEV_TYPE => {
-            if let Some(scsi_addr) = scsi_addr {
-                scsi_addr.to_string()
-            } else {
-                return Err(anyhow!("block driver is scsi but no scsi address exists"));
-            }
-        }
-        KATA_CCW_DEV_TYPE => {
-            if let Some(ccw_addr) = ccw_addr {
-                ccw_addr.to_string()
-            } else {
-                return Err(anyhow!("block driver is ccw but no ccw address exists"));
-            }
-        }
-        _ => virt_path.to_string(),
-    };
-
-    Ok(source)
 }
 
 pub async fn handle_block_volume(
@@ -192,18 +150,12 @@ pub async fn handle_block_volume(
     if let DeviceType::BlockModern(device_mod) = device_info.clone() {
         let device = &device_mod.lock().await;
         storage.driver = device.config.driver_option.clone();
-        storage.source = extract_storage_source(
-            &device.config.driver_option,
-            device.config.pci_path.as_ref(),
-            device.config.scsi_addr.as_deref(),
-            device.config.ccw_addr.as_deref(),
-            &device.config.virt_path,
-        )?;
+        storage.source = agent_storage_source_from_block_config(&device.config)?;
         device_id = device.device_id.clone();
     }
 
     // generate host guest shared path
-    let guest_path = generate_shared_path(m.destination().clone(), read_only, &device_id, sid)
+    let guest_path = generate_shared_path(m.destination().clone(), &device_id, sid)
         .await
         .context("generate host-guest shared path failed")?;
     storage.mount_point = guest_path.clone();
@@ -230,9 +182,18 @@ pub async fn handle_block_volume(
     mount.set_destination(m.destination().clone());
     mount.set_typ(Some(KATA_MOUNT_BIND_TYPE.to_string()));
     mount.set_source(Some(PathBuf::from(&guest_path)));
-    mount.set_options(Some(build_bind_mount_options(volume_options.unwrap_or(&[]), m.options())));
+    mount.set_options(Some(build_bind_mount_options(
+        volume_options.unwrap_or(&[]),
+        m.options(),
+    )));
 
-    debug!(sl!(), "handle block volume with device_id: {}, storage: {:?}, mount: {:?}", device_id, storage, mount);
+    debug!(
+        sl!(),
+        "handle block volume with device_id: {}, storage: {:?}, mount: {:?}",
+        device_id,
+        storage,
+        mount
+    );
 
     Ok((storage, mount, device_id))
 }
@@ -240,6 +201,8 @@ pub async fn handle_block_volume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GENERATE_SHARED_PATH_TEST_ENV: &str = "KATA_TEST_GENERATE_SHARED_PATH";
 
     #[test]
     fn test_build_bind_mount_options_merges_volume_options() {
@@ -274,6 +237,50 @@ mod tests {
                 "nodev".to_string(),
                 KATA_MOUNT_BIND_TYPE.to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_shared_path_read_only() {
+        if std::env::var_os(GENERATE_SHARED_PATH_TEST_ENV).is_some() {
+            kata_types::rootless::set_rootless(true);
+
+            let sid = "test-sandbox";
+            let device_id = "test-device";
+            let host_rw_path = crate::share_fs::get_host_rw_shared_path(sid);
+            let host_shared_path = host_rw_path.parent().unwrap();
+            let host_ro_path = host_shared_path.join("ro");
+            fs::create_dir_all(host_shared_path).unwrap();
+
+            // A file makes a write through ro fail even when running as root.
+            fs::write(&host_ro_path, b"must not be modified").unwrap();
+
+            let guest_path =
+                generate_shared_path(PathBuf::from("/mnt/test-volume"), device_id, sid)
+                    .await
+                    .unwrap();
+            let mount_name = Path::new(&guest_path).file_name().unwrap();
+
+            assert!(host_rw_path.join("passthrough").join(mount_name).is_dir());
+            assert!(host_ro_path.is_file());
+            return;
+        }
+
+        // Rootless state is process-global, so isolate it from parallel tests.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_generate_shared_path_read_only")
+            .arg("--test-threads=1")
+            .env(GENERATE_SHARED_PATH_TEST_ENV, "1")
+            .env("XDG_RUNTIME_DIR", temp_dir.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "isolated shared-path test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

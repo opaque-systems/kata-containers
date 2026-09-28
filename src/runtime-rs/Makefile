@@ -15,11 +15,6 @@ PROJECT_URL = https://github.com/kata-containers
 PROJECT_COMPONENT = containerd-shim-kata-v2
 CONTAINERD_RUNTIME_NAME = io.containerd.kata.v2
 
-# This snippet finds all packages inside runtime-rs. Used for tessting.
-PACKAGES := $(shell cargo metadata --no-deps --format-version 1 | \
-                    jq -r '.packages[] | select(.manifest_path | contains("runtime-rs")) | .name')
-PACKAGE_FLAGS := $(patsubst %,-p %,$(PACKAGES))
-
 include ../../utils.mk
 
 ##VAR RELEASE_LTO=true|false|thin|fat LTO setting used for release builds
@@ -66,6 +61,7 @@ CLHBINDIR := $(PREFIXDEPS)/bin
 QEMUBINDIR := $(PREFIXDEPS)/bin
 PROJECT_DIR = $(PROJECT_TAG)
 IMAGENAME = $(PROJECT_TAG).img
+IMAGENAME_AZURE = $(PROJECT_TAG)-mariner.img
 IMAGECONFIDENTIALNAME = $(PROJECT_TAG)-confidential.img
 INITRDNAME = $(PROJECT_TAG)-initrd.img
 INITRDCONFIDENTIALNAME = $(PROJECT_TAG)-initrd-confidential.img
@@ -80,6 +76,8 @@ HYPERVISOR_QEMU = qemu
 HYPERVISOR_CLH = clh-runtime-rs
 HYPERVISOR_NAME_CLH = clh
 HYPERVISOR_REMOTE = remote
+HYPERVISOR_OPENVMM = openvmm-runtime-rs
+HYPERVISOR_NAME_OPENVMM = openvmm
 
 ARCH_SUPPORT_DB := x86_64 aarch64
 ifneq ($(filter $(ARCH),$(ARCH_SUPPORT_DB)),)
@@ -91,10 +89,19 @@ else
         Specify "USE_BUILTIN_DB=true" to force enable.)
 endif
 
+ARCH_SUPPORT_OPENVMM := x86_64 aarch64
+ifneq ($(filter $(ARCH),$(ARCH_SUPPORT_OPENVMM)),)
+    USE_OPENVMM := true
+else
+    USE_OPENVMM := false
+    $(info OpenVMM integration does not support ARCH $(ARCH), disabled. \
+        Specify "USE_OPENVMM=true" to force enable.)
+endif
+
 HYPERVISOR ?= $(HYPERVISOR_QEMU)
 
 ##VAR HYPERVISOR=<hypervisor_name> List of hypervisors this build system can generate configuration for.
-HYPERVISORS := $(HYPERVISOR_DB) $(HYPERVISOR_FC) $(HYPERVISOR_QEMU) $(HYPERVISOR_CLH) $(HYPERVISOR_REMOTE)
+HYPERVISORS := $(HYPERVISOR_DB) $(HYPERVISOR_FC) $(HYPERVISOR_QEMU) $(HYPERVISOR_CLH) $(HYPERVISOR_REMOTE) $(HYPERVISOR_OPENVMM)
 
 CLHPATH := $(CLHBINDIR)/$(CLHCMD)
 CLHVALIDHYPERVISORPATHS := [\"$(CLHPATH)\"]
@@ -104,6 +111,7 @@ PKGDATADIR := $(PREFIXDEPS)/share/$(PROJECT_DIR)
 PKGRUNDIR := $(LOCALSTATEDIR)/run/$(PROJECT_DIR)
 KERNELDIR := $(PKGDATADIR)
 IMAGEPATH := $(PKGDATADIR)/$(IMAGENAME)
+IMAGEPATH_AZURE := $(PKGDATADIR)/$(IMAGENAME_AZURE)
 IMAGECONFIDENTIALPATH := $(PKGDATADIR)/$(IMAGECONFIDENTIALNAME)
 COCOIMAGENAME := $(PROJECT_TAG)-coco-extension.img
 COCOIMAGEPATH := $(PKGDATADIR)/$(COCOIMAGENAME)
@@ -180,6 +188,10 @@ DEFOVERHEADMEMSZ_NV_BASE := 128
 DEFOVERHEADVCPUS_CLH := 0.2
 ##VAR DEFOVERHEADMEMSZ_CLH=<number> Memory overhead (MiB) for clh runtimes
 DEFOVERHEADMEMSZ_CLH := 32
+##VAR DEFOVERHEADVCPUS_OPENVMM=<number> vCPU overhead for openvmm runtimes
+DEFOVERHEADVCPUS_OPENVMM := 0.2
+##VAR DEFOVERHEADMEMSZ_OPENVMM=<number> Memory overhead (MiB) for openvmm runtimes
+DEFOVERHEADMEMSZ_OPENVMM := 32
 ##VAR DEFOVERHEADVCPUS_DB=<number> vCPU overhead for dragonball runtimes
 DEFOVERHEADVCPUS_DB := 0.2
 ##VAR DEFOVERHEADMEMSZ_DB=<number> Memory overhead (MiB) for dragonball runtimes
@@ -206,7 +218,9 @@ DEFNETQUEUES := 1
 # Security note: do not enable "virtio_fs_extra_args" by default.
 # Allowing pods to pass arbitrary virtiofsd arguments can be abused for malicious host-side behavior.
 DEFENABLEANNOTATIONS := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\"]
+DEFENABLEANNOTATIONS_NVIDIA := []
 DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"kernel_params\", \"kernel_verity_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
+DEFENABLEANNOTATIONS_COCO_NVIDIA := [\"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFEMPTYDIRMODE := shared-fs
 DEFEMPTYDIRMODE_COCO := block-encrypted
@@ -218,7 +232,6 @@ DEFENABLEVIRTIOMEM ?= false
 ##VAR DEFENTROPYSOURCE=[entropy_source] Default entropy source
 DEFENTROPYSOURCE := /dev/urandom
 DEFVALIDENTROPYSOURCES := [\"/dev/urandom\",\"/dev/random\",\"\"]
-DEFDISABLEBLOCK := false
 DEFSHAREDFS_CLH_VIRTIOFS := virtio-fs
 DEFVIRTIOFSDAEMON := $(LIBEXECDIR)/virtiofsd
 DEFVALIDVIRTIOFSDAEMONPATHS := [\"$(DEFVIRTIOFSDAEMON)\"]
@@ -333,9 +346,11 @@ ifneq (,$(CLHCMD))
     CONFIGS += $(CONFIG_CLH_AZURE)
 
     # CLH-specific options (all should be suffixed by "_CLH")
+    DEFDISABLENESTEDVIRTUALIZATION_CLH := false
+    DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE := true
     # currently, huge pages are required for virtiofsd support
     DEFNETWORKMODEL_CLH := tcfilter
-    IMAGEPATH_CLH_AZURE := $(PKGDATADIR)/kata-containers-mariner.img
+    IMAGEPATH_CLH_AZURE := $(IMAGEPATH_AZURE)
     KERNELPATH_CLH_AZURE := /usr/share/cloud-hypervisor/vmlinux.bin
     DEFSTATICRESOURCEMGMT_CLH_AZURE := true
     KERNELTYPE_CLH = uncompressed
@@ -356,6 +371,11 @@ ifneq (,$(QEMUCMD))
 
     QEMUPATH := $(QEMUBINDIR)/$(QEMUCMD)
     QEMUVALIDHYPERVISORPATHS := [\"$(QEMUPATH)\"]
+
+ifneq (,$(QEMUNOSHAREDFSCMD))
+    QEMUNOSHAREDFSPATH := $(QEMUBINDIR)/$(QEMUNOSHAREDFSCMD)
+    QEMUNOSHAREDFSVALIDHYPERVISORPATHS := [\"$(QEMUNOSHAREDFSPATH)\"]
+endif
 
 ifneq (,$(QEMUSNPCMD))
     QEMUSNPPATH := $(QEMUBINDIR)/$(QEMUSNPCMD)
@@ -424,6 +444,9 @@ endif
 
     CONFIGS += $(CONFIG_QEMU_COCO_DEV)
 
+# Both NVIDIA runtime classes run without a shared filesystem, so both are
+# generated against the trimmed qemu and only where it is built.
+ifneq (,$(QEMUNOSHAREDFSCMD))
     CONFIG_FILE_QEMU_NVIDIA_GPU = configuration-qemu-nvidia-gpu-runtime-rs.toml
     CONFIG_QEMU_NVIDIA_GPU = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU)
     CONFIG_QEMU_NVIDIA_GPU_IN = $(CONFIG_QEMU_NVIDIA_GPU).in
@@ -447,6 +470,7 @@ endif
     SYSCONFIG_PATHS += $(SYSCONFIG_QEMU_NVIDIA_CPU)
 
     CONFIGS += $(CONFIG_QEMU_NVIDIA_CPU)
+endif
 
 ifneq (,$(QEMUSNPCMD))
     CONFIG_FILE_QEMU_NVIDIA_GPU_SNP = configuration-qemu-nvidia-gpu-snp-runtime-rs.toml
@@ -511,9 +535,10 @@ endif
     DEFAULTPCIEROOTPORT_NV := 8
     DEFDISABLEIMAGENVDIMM_NV := true
     DEFSANDBOXCGROUPONLY_NV := true
-    DEFENABLEVCPUSPINNING_NV := true
+    DEFENABLEVCPUSPINNING_NV := false
     DEFSTATICRESOURCEMGMT_NV := true
     DEFVFIOMODE_NV := guest-kernel
+    DEFSECCOMPSANDBOXPARAM_NV := on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny
     DEFKUBELETROOTDIR := /var/lib/kubelet
     DEFPODRESOURCEAPISOCK_NV := "$(DEFKUBELETROOTDIR)/pod-resources/kubelet.sock"
     # NVIDIA profile: rootfs filesystem type (erofs for read-only, compressed images)
@@ -535,6 +560,8 @@ endif
 
     KERNEL_NAME_QEMU_SE = kata-containers-se.img
     KERNELPATH_QEMU_SE = $(KERNELDIR)/$(KERNEL_NAME_QEMU_SE)
+    KERNEL_NAME_QEMU_SE_RUNTIME_RS = kata-containers-se-runtime-rs.img
+    KERNELPATH_QEMU_SE_RUNTIME_RS = $(KERNELDIR)/$(KERNEL_NAME_QEMU_SE_RUNTIME_RS)
 
     KERNEL_TYPE_COCO = compressed
     KERNEL_NAME_COCO = $(call MAKE_KERNEL_NAME,$(KERNEL_TYPE_COCO))
@@ -575,8 +602,9 @@ endif
     DEFNETWORKMODEL_QEMU := tcfilter
     DEFDISABLEGUESTSELINUX := true
     # Default is empty string "" to match Rust default None (when commented out in config).
-    # Most users will want to set this to "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
-    # for better security. Note: "elevateprivileges=deny" doesn't work with daemonize option.
+    # Most users will want to set this to
+    # "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+    # for better security.
     DEFSECCOMPSANDBOXPARAM := ""
 endif
 
@@ -617,6 +645,35 @@ ifneq (,$(REMOTE))
     DEFSANDBOXCGROUPONLY_REMOTE := true
 endif
 
+ifeq ($(USE_OPENVMM),true)
+    KNOWN_HYPERVISORS += $(HYPERVISOR_OPENVMM)
+    CONFIG_FILE_OPENVMM = configuration-openvmm-azure-runtime-rs.toml
+    CONFIG_OPENVMM = config/$(CONFIG_FILE_OPENVMM)
+    CONFIG_OPENVMM_IN = $(CONFIG_OPENVMM).in
+    CONFIG_PATH_OPENVMM = $(abspath $(CONFDIR)/$(CONFIG_FILE_OPENVMM))
+    CONFIG_PATHS += $(CONFIG_PATH_OPENVMM)
+    SYSCONFIG_OPENVMM = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_OPENVMM))
+    SYSCONFIG_PATHS += $(SYSCONFIG_OPENVMM)
+    CONFIGS += $(CONFIG_OPENVMM)
+    # openvmm-specific options (all should be suffixed by "_OPENVMM")
+    OPENVMMCMD ?= openvmm
+    OPENVMMPATH := $(PREFIXDEPS)/bin/$(OPENVMMCMD)
+    OPENVMMVALIDHYPERVISORPATHS := [\"$(OPENVMMPATH)\"]
+    VMROOTFSDRIVER_OPENVMM := virtio-blk-pci
+    DEFBLOCKSTORAGEDRIVER_OPENVMM := virtio-blk-pci
+    DEFNETWORKMODEL_OPENVMM := tcfilter
+    KERNELPARAMS_OPENVMM = console=hvc0 cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1
+    KERNELTYPE_OPENVMM = uncompressed
+    KERNEL_NAME_OPENVMM = $(call MAKE_KERNEL_NAME,$(KERNELTYPE_OPENVMM))
+    KERNELPATH_OPENVMM = $(KERNELDIR)/$(KERNEL_NAME_OPENVMM)
+    IMAGEPATH_OPENVMM_AZURE := $(IMAGEPATH_AZURE)
+    DEFSANDBOXCGROUPONLY_OPENVMM := true
+    DEFSTATICRESOURCEMGMT_OPENVMM_AZURE := true
+    DEFSHAREDFS_OPENVMM := virtio-fs
+    RUNTIMENAME := virt_container
+    PIPESIZE := 1
+endif
+
 ifeq ($(HYPERVISOR),$(HYPERVISOR_DB))
     DEFAULT_HYPERVISOR_CONFIG = $(CONFIG_FILE_DB)
 endif
@@ -636,6 +693,7 @@ USER_VARS += BINDIR
 USER_VARS += CONFIG_CLH_IN
 USER_VARS += CONFIG_DB_IN
 USER_VARS += CONFIG_FC_IN
+USER_VARS += CONFIG_OPENVMM_IN
 USER_VARS += CONFIG_PATH
 USER_VARS += CONFIG_QEMU_IN
 USER_VARS += CONFIG_QEMU_SE_IN
@@ -646,6 +704,7 @@ USER_VARS += CONFIG_QEMU_NVIDIA_CPU_IN
 USER_VARS += DESTDIR
 USER_VARS += HYPERVISOR
 USER_VARS += USE_BUILTIN_DB
+USER_VARS += USE_OPENVMM
 USER_VARS += DBCMD
 USER_VARS += DBCTLCMD
 USER_VARS += FCCTLCMD
@@ -657,6 +716,9 @@ USER_VARS += CLHPATH
 USER_VARS += CLHVALIDHYPERVISORPATHS
 USER_VARS += QEMUPATH
 USER_VARS += QEMUVALIDHYPERVISORPATHS
+USER_VARS += QEMUNOSHAREDFSCMD
+USER_VARS += QEMUNOSHAREDFSPATH
+USER_VARS += QEMUNOSHAREDFSVALIDHYPERVISORPATHS
 USER_VARS += QEMUSNPCMD
 USER_VARS += QEMUSNPPATH
 USER_VARS += QEMUSNPVALIDHYPERVISORPATHS
@@ -675,10 +737,12 @@ USER_VARS += FCVALIDJAILERPATHS
 USER_VARS += DEFMAXMEMSZ_FC
 USER_VARS += SYSCONFIG
 USER_VARS += IMAGENAME
+USER_VARS += IMAGENAME_AZURE
 USER_VARS += IMAGENAME_NV
 USER_VARS += IMAGECONFIDENTIALNAME
 USER_VARS += IMAGEPATH
 USER_VARS += IMAGEPATH_CLH_AZURE
+USER_VARS += IMAGEPATH_OPENVMM_AZURE
 USER_VARS += IMAGEPATH_NV
 USER_VARS += IMAGENAME_NV_BASE
 USER_VARS += IMAGEPATH_NV_BASE
@@ -704,6 +768,8 @@ USER_VARS += KERNELPATH_DB
 USER_VARS += KERNELPATH_QEMU
 USER_VARS += KERNELPATH_NV
 USER_VARS += KERNELPATH_QEMU_SE
+USER_VARS += KERNEL_NAME_QEMU_SE_RUNTIME_RS
+USER_VARS += KERNELPATH_QEMU_SE_RUNTIME_RS
 USER_VARS += KERNELPATH_FC
 USER_VARS += KERNELPATH_COCO
 USER_VARS += KERNELPATH
@@ -765,7 +831,6 @@ USER_VARS += DEFDISABLEGUESTSECCOMP
 USER_VARS += DEFDISABLESELINUX
 USER_VARS += DEFDISABLEGUESTSELINUX
 USER_VARS += DEFAULTEXPFEATURES
-USER_VARS += DEFDISABLEBLOCK
 USER_VARS += DEFBLOCKSTORAGEDRIVER_DB
 USER_VARS += DEFBLOCKSTORAGEDRIVER_QEMU
 USER_VARS += DEFBLOCKDEVICEAIO_QEMU
@@ -781,7 +846,9 @@ USER_VARS += DEFVIRTIOFSCACHE
 USER_VARS += DEFVIRTIOFSQUEUESIZE
 USER_VARS += DEFVIRTIOFSEXTRAARGS
 USER_VARS += DEFENABLEANNOTATIONS
+USER_VARS += DEFENABLEANNOTATIONS_NVIDIA
 USER_VARS += DEFENABLEANNOTATIONS_COCO
+USER_VARS += DEFENABLEANNOTATIONS_COCO_NVIDIA
 USER_VARS += DEFENABLEIOTHREADS
 USER_VARS += DEFINDEPIOTHREADS
 USER_VARS += DEFSECCOMPSANDBOXPARAM
@@ -796,6 +863,8 @@ USER_VARS += DEFSANDBOXCGROUPONLY_DB
 USER_VARS += DEFSANDBOXCGROUPONLY_FC
 USER_VARS += DEFSANDBOXCGROUPONLY_CLH
 USER_VARS += DEFENABLEVIRTIOMEM
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH
+USER_VARS += DEFDISABLENESTEDVIRTUALIZATION_CLH_AZURE
 USER_VARS += DEFSANDBOXCGROUPONLY_REMOTE
 USER_VARS += DEFENABLEVCPUSPINNING_QEMU
 USER_VARS += DEFSTATICRESOURCEMGMT_DB
@@ -815,9 +884,24 @@ USER_VARS += HYPERVISOR_CLH
 USER_VARS += HYPERVISOR_NAME_CLH
 USER_VARS += HYPERVISOR_QEMU
 USER_VARS += HYPERVISOR_FC
+USER_VARS += HYPERVISOR_OPENVMM
+USER_VARS += HYPERVISOR_NAME_OPENVMM
 USER_VARS += PIPESIZE
 USER_VARS += DBSHAREDFS
 USER_VARS += DEF_DGB_BRIDGES
+USER_VARS += KERNELPATH_OPENVMM
+USER_VARS += KERNELPARAMS_OPENVMM
+USER_VARS += OPENVMMCMD
+USER_VARS += OPENVMMPATH
+USER_VARS += OPENVMMVALIDHYPERVISORPATHS
+USER_VARS += VMROOTFSDRIVER_OPENVMM
+USER_VARS += DEFBLOCKSTORAGEDRIVER_OPENVMM
+USER_VARS += DEFNETWORKMODEL_OPENVMM
+USER_VARS += DEFSANDBOXCGROUPONLY_OPENVMM
+USER_VARS += DEFSTATICRESOURCEMGMT_OPENVMM_AZURE
+USER_VARS += DEFOVERHEADVCPUS_OPENVMM
+USER_VARS += DEFOVERHEADMEMSZ_OPENVMM
+USER_VARS += DEFSHAREDFS_OPENVMM
 USER_VARS += KATA_INSTALL_GROUP
 USER_VARS += KATA_INSTALL_OWNER
 USER_VARS += KATA_INSTALL_CFG_PERMS
@@ -846,7 +930,7 @@ USER_VARS += DEFSANDBOXCGROUPONLY_NV
 USER_VARS += DEFENABLEVCPUSPINNING_NV
 USER_VARS += DEFSTATICRESOURCEMGMT_NV
 USER_VARS += DEFVFIOMODE_NV
-USER_VARS += DEFKUBELETROOTDIR
+USER_VARS += DEFSECCOMPSANDBOXPARAM_NV
 USER_VARS += DEFPODRESOURCEAPISOCK_NV
 USER_VARS += DEFROOTFSTYPE_NV
 USER_VARS += VMROOTFSDRIVER_NV
@@ -875,11 +959,22 @@ EXTRA_RUSTFEATURES :=
 
 # if use dragonball hypervisor, add the feature to build dragonball in runtime
 ifeq ($(USE_BUILTIN_DB),true)
-    EXTRA_RUSTFEATURES +=  dragonball
+    EXTRA_RUSTFEATURES += dragonball
 endif
 
+# if use openvmm hypervisor, add the feature to build openvmm in runtime
+ifeq ($(USE_OPENVMM),true)
+    EXTRA_RUSTFEATURES += openvmm
+endif
+
+# EXTRA_RUSTFEATURES is a space-separated list (e.g. "dragonball openvmm"), but
+# cargo's --features expects a single comma-separated argument, so join the
+# accumulated features with commas.
 ifneq ($(EXTRA_RUSTFEATURES),)
-    override EXTRA_RUSTFEATURES := --features $(EXTRA_RUSTFEATURES)
+    comma := ,
+    empty :=
+    space := $(empty) $(empty)
+    override EXTRA_RUSTFEATURES := --features $(subst $(space),$(comma),$(strip $(EXTRA_RUSTFEATURES)))
 endif
 
 
@@ -1091,6 +1186,10 @@ install-runtime: runtime
 install-configs: $(CONFIGS)
 	$(foreach f,$(CONFIGS),$(call INSTALL_FILE,$f,$(dir $(CONFIG_PATH)))) \
 	ln -sf $(DEFAULT_HYPERVISOR_CONFIG) $(DESTDIR)/$(CONFIG_PATH)
+ifeq ($(ARCH),powerpc64le)
+	sed -i 's|^image = .*|initrd = "$(PREFIX)/share/kata-containers/kata-containers-initrd.img"|' \
+		$(DESTDIR)$(CONFIG_PATH_QEMU)
+endif
 
 .PHONY: \
 	help \

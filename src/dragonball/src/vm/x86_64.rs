@@ -21,8 +21,8 @@ use dbs_interrupt::IOAPIC_MAX_NR_REDIR_ENTRIES;
 use dbs_utils::epoll_manager::EpollManager;
 use dbs_utils::time::TimestampUs;
 use kvm_bindings::{
-    kvm_enable_cap, kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_CAP_SPLIT_IRQCHIP,
-    KVM_PIT_SPEAKER_DUMMY,
+    kvm_enable_cap, kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_CAP_EXIT_HYPERCALL,
+    KVM_CAP_SPLIT_IRQCHIP, KVM_PIT_SPEAKER_DUMMY,
 };
 use linux_loader::cmdline::Cmdline;
 use linux_loader::configurator::{linux::LinuxBootConfigurator, BootConfigurator, BootParams};
@@ -34,6 +34,7 @@ use crate::address_space_manager::{GuestAddressSpaceImpl, GuestMemoryImpl};
 use crate::api::v1::ConfidentialVmType;
 use crate::error::{Error, Result, StartMicroVmError};
 use crate::event_manager::EventManager;
+use crate::vcpu::KVM_HC_MAP_GPA_RANGE;
 use crate::vm::{VcpuManagerError, Vm, VmError};
 
 /// Configures the system and should be called once per vm before starting vcpu
@@ -182,6 +183,32 @@ impl Vm {
         vm_as: GuestAddressSpaceImpl,
         request_ts: TimestampUs,
     ) -> std::result::Result<(), StartMicroVmError> {
+        self.init_microvm_with_boot_mode(epoll_mgr, vm_as, request_ts, false)
+    }
+
+    /// Initialize a microVM that will resume from a snapshot.
+    ///
+    /// Unlike a cold boot, a snapshot restore does not need to load the guest
+    /// kernel or construct its initial boot register state: guest memory and
+    /// every vCPU register are replaced by the saved state before the vCPUs
+    /// start. Avoiding that throwaway work keeps the restore path focused on
+    /// rebuilding host-side devices and applying the snapshot.
+    pub fn init_microvm_from_snapshot(
+        &mut self,
+        epoll_mgr: EpollManager,
+        vm_as: GuestAddressSpaceImpl,
+        request_ts: TimestampUs,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        self.init_microvm_with_boot_mode(epoll_mgr, vm_as, request_ts, true)
+    }
+
+    fn init_microvm_with_boot_mode(
+        &mut self,
+        epoll_mgr: EpollManager,
+        vm_as: GuestAddressSpaceImpl,
+        request_ts: TimestampUs,
+        restore_from_snapshot: bool,
+    ) -> std::result::Result<(), StartMicroVmError> {
         info!(self.logger, "VM: start initializing microvm ...");
 
         self.init_tss()?;
@@ -189,7 +216,11 @@ impl Vm {
         // while on aarch64 we need to do it the other way around.
         self.setup_interrupt_controller()?;
         self.create_pit()?;
-        self.init_devices(epoll_mgr)?;
+        if restore_from_snapshot {
+            self.init_devices_from_snapshot(epoll_mgr)?;
+        } else {
+            self.init_devices(epoll_mgr)?;
+        }
 
         let reset_event_fd = self.device_manager.get_reset_eventfd().unwrap();
         self.vcpu_manager()
@@ -200,6 +231,18 @@ impl Vm {
         if self.vm_config.cpu_pm == "on" {
             // TODO: add cpu_pm support. issue #4590.
             info!(self.logger, "VM: enable CPU disable_idle_exits capability");
+        }
+
+        // On a standard cold start, vCPU creation is deferred to
+        // `create_boot_vcpus()` until after the kernel has been loaded.
+        if restore_from_snapshot {
+            let boot_vcpu_count = self.vm_config.vcpu_count;
+            self.vcpu_manager()
+                .map_err(StartMicroVmError::Vcpu)?
+                .create_vcpus(boot_vcpu_count, Some(request_ts), None, None)
+                .map_err(StartMicroVmError::Vcpu)?;
+
+            return Ok(());
         }
 
         let vm_memory = vm_as.memory();
@@ -239,6 +282,7 @@ impl Vm {
                 .map_err(StartMicroVmError::Vcpu)?;
 
             if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+                self.enable_hc_map_gpa_range()?;
                 self.tdx_init_vcpus(hob_address)?;
                 self.tdx_init_mem_region(vm_memory.deref(), &sections)?;
                 self.tdx_finalize()?;
@@ -521,6 +565,17 @@ impl Vm {
             .map_err(StartMicroVmError::TdvfError)?;
 
         Ok(())
+    }
+
+    pub(super) fn enable_hc_map_gpa_range(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        let mut enable_hc_map_gpa_range = kvm_enable_cap {
+            cap: KVM_CAP_EXIT_HYPERCALL,
+            ..Default::default()
+        };
+        enable_hc_map_gpa_range.args[0] = 1 << KVM_HC_MAP_GPA_RANGE;
+        self.vm_fd()
+            .enable_cap(&enable_hc_map_gpa_range)
+            .map_err(StartMicroVmError::EnableHcMapGpaRange)
     }
 
     pub(super) fn tdx_init_vm(&mut self) -> std::result::Result<(), StartMicroVmError> {

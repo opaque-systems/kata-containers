@@ -18,6 +18,8 @@ pub use self::device::*;
 mod notifier;
 pub use self::notifier::*;
 
+pub mod persist;
+
 pub mod epoll_helper;
 
 #[cfg(feature = "virtio-mmio")]
@@ -52,6 +54,9 @@ pub mod mem;
 
 #[cfg(feature = "virtio-balloon")]
 pub mod balloon;
+
+#[cfg(feature = "virtio-rng")]
+pub mod rng;
 
 #[cfg(feature = "vhost")]
 pub mod vhost;

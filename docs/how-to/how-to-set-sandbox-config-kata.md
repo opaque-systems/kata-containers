@@ -26,7 +26,7 @@ There are several kinds of Kata configurations and they are listed below.
 | `io.katacontainers.config.runtime.experimental` | `boolean` | determines if experimental features enabled |
 | `io.katacontainers.config.runtime.disable_guest_seccomp`| `boolean` | determines if `seccomp` should be applied inside guest |
 | `io.katacontainers.config.runtime.disable_new_netns` | `boolean` | determines if a new netns is created for the hypervisor process |
-| `io.katacontainers.config.runtime.internetworking_model` | string| determines how the VM should be connected to the container network interface. Valid values are `macvtap`, `tcfilter` and `none` |
+| `io.katacontainers.config.runtime.internetworking_model` | string| determines how the VM should be connected to the container network interface. Valid values are `macvtap`, `tcfilter`, `l3forwarding` (runtime-rs only, experimental) and `none` |
 | `io.katacontainers.config.runtime.sandbox_cgroup_only`| `boolean` | determines if Kata processes are managed only in sandbox cgroup |
 | `io.katacontainers.config.runtime.enable_pprof` | `boolean` | enables Golang `pprof` for `containerd-shim-kata-v2` process |
 | `io.katacontainers.config.runtime.create_container_timeout` | `uint64` | the timeout for create a container in `seconds`, default is `60` |
@@ -66,7 +66,7 @@ Warning: do not enable `virtio_fs_extra_args` in `enable_annotations` unless you
 | `io.katacontainers.config.hypervisor.default_max_vcpus` | uint32| the maximum number of vCPUs allocated for the VM by the hypervisor |
 | `io.katacontainers.config.hypervisor.default_memory` | uint32| the memory assigned for a VM by the hypervisor in `MiB` |
 | `io.katacontainers.config.hypervisor.default_vcpus` | float32| the default vCPUs assigned for a VM by the hypervisor |
-| `io.katacontainers.config.hypervisor.disable_block_device_use` | `boolean` | disable hotplugging host block devices to guest VMs for container rootfs |
+| `io.katacontainers.config.hypervisor.disable_block_device_use` | `boolean` | disable hotplugging host block devices to guest VMs for container rootfs (Go runtime only) |
 | `io.katacontainers.config.hypervisor.disable_image_nvdimm` | `boolean` | specify if a `nvdimm` device should be used as rootfs for the guest (QEMU) |
 | `io.katacontainers.config.hypervisor.disable_vhost_net` | `boolean` | specify if `vhost-net` is not available on the host |
 | `io.katacontainers.config.hypervisor.enable_hugepages` | `boolean` | if the memory should be `pre-allocated` from huge pages |

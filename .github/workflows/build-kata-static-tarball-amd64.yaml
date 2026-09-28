@@ -36,6 +36,7 @@ jobs:
   build-asset:
     name: build-asset
     runs-on: ubuntu-22.04
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
@@ -54,11 +55,13 @@ jobs:
           - kernel-dragonball-experimental
           - kernel-nvidia-gpu
           - nydus
+          - openvmm
           - ovmf
           - ovmf-sev
           - ovmf-tdx
           - pause-image
           - qemu
+          - qemu-no-shared-fs
           - qemu-snp-experimental
           - qemu-tdx-experimental
           - virtiofsd
@@ -108,6 +111,8 @@ jobs:
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
           KBUILD_SIGN_PIN: ${{ contains(matrix.asset, 'nvidia') && secrets.KBUILD_SIGN_PIN || '' }}
           USE_DEVMAPPER: ${{ matrix.asset == 'agent' && 'yes' || 'no' }}
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_COCO_EXTENSION_PROVENANCE: "yes"
 
       - name: Parse OCI image name and digest
         id: parse-oci-segments
@@ -159,11 +164,11 @@ jobs:
   build-kata-deploy-components:
     name: build-kata-deploy-components
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     strategy:
       matrix:
         component:
           - kata-deploy-binary
-          - kata-deploy-job-dispatcher
           - nydus-snapshotter-for-coco-guest-pull
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-amd64-${{ toJSON(matrix) }}
@@ -200,6 +205,7 @@ jobs:
   build-asset-rootfs:
     name: build-asset-rootfs
     runs-on: ubuntu-22.04
+    timeout-minutes: 25
     needs: build-asset
     permissions:
       contents: read
@@ -210,6 +216,7 @@ jobs:
           - rootfs-image
           - rootfs-image-confidential
           - rootfs-image-coco-extension
+          - rootfs-image-devkit-extension
           - rootfs-image-mariner
           - rootfs-image-nvidia-gpu
           - rootfs-image-nvidia-gpu-confidential
@@ -266,6 +273,9 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target-branch }}
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
           KBUILD_SIGN_PIN: ${{ contains(matrix.asset, 'nvidia') && secrets.KBUILD_SIGN_PIN || '' }}
+          # Used to verify the guest-components CoCo extension provenance.
+          GH_TOKEN: ${{ github.token }}
+          VERIFY_COCO_EXTENSION_PROVENANCE: "yes"
 
       - name: store-artifact ${{ matrix.asset }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -279,6 +289,7 @@ jobs:
   remove-rootfs-binary-artifacts:
     name: remove-rootfs-binary-artifacts
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: build-asset-rootfs
     strategy:
       matrix:
@@ -299,6 +310,7 @@ jobs:
   remove-rootfs-binary-artifacts-for-release:
     name: remove-rootfs-binary-artifacts-for-release
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: build-asset-rootfs
     strategy:
       matrix:
@@ -316,6 +328,7 @@ jobs:
   build-asset-shim-v2:
     name: build-asset-shim-v2
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
     needs: [build-asset, build-asset-rootfs, remove-rootfs-binary-artifacts, remove-rootfs-binary-artifacts-for-release]
     permissions:
       contents: read
@@ -411,30 +424,40 @@ jobs:
           merge-multiple: true
       - name: merge-artifacts
         run: |
-          ./tools/packaging/kata-deploy/local-build/kata-deploy-merge-builds.sh kata-artifacts versions.yaml
+          ./tools/packaging/kata-deploy/local-build/kata-deploy-merge-release-tarballs.sh kata-artifacts versions.yaml amd64
         env:
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
-      - name: Check kata tarball size (GitHub release asset limit)
+      - name: Check kata tarball sizes (GitHub release asset limit)
         run: |
           # https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases#storage-and-bandwidth-quotas
           GITHUB_ASSET_MAX_BYTES=2147483648
-          tarball_size=$(stat -c "%s" kata-static.tar.zst)
-          if [[ "${tarball_size}" -ge "${GITHUB_ASSET_MAX_BYTES}" ]]; then
-            echo "::error::tarball size (${tarball_size} bytes) >= GitHub release asset limit (${GITHUB_ASSET_MAX_BYTES} bytes)"
-            exit 1
-          fi
-          echo "tarball size: ${tarball_size} bytes"
-      - name: store-artifacts
+          for tarball in kata-static.tar.zst kata-go-static.tar.zst; do
+            tarball_size=$(stat -c "%s" "${tarball}")
+            if [[ "${tarball_size}" -ge "${GITHUB_ASSET_MAX_BYTES}" ]]; then
+              echo "::error::${tarball} size (${tarball_size} bytes) >= GitHub release asset limit (${GITHUB_ASSET_MAX_BYTES} bytes)"
+              exit 1
+            fi
+            echo "${tarball} size: ${tarball_size} bytes"
+          done
+      - name: store runtime-rs artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-static.tar.zst
           retention-days: 15
           if-no-files-found: error
+      - name: store Go runtime artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: kata-go-static-tarball-amd64${{ inputs.tarball-suffix }}
+          path: kata-go-static.tar.zst
+          retention-days: 15
+          if-no-files-found: error
 
   build-tools-asset:
     name: build-tools-asset
     runs-on: ubuntu-22.04
+    timeout-minutes: 35
     permissions:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
@@ -500,6 +523,7 @@ jobs:
   create-kata-tools-tarball:
     name: create-kata-tools-tarball
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: [build-tools-asset]
     permissions:
       contents: read

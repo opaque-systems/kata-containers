@@ -21,6 +21,7 @@ setup() {
     fi
 
     setup_common || die "setup_common failed"
+    runtime_class="$(get_test_runtime_class)"
     unencrypted_image="quay.io/prometheus/busybox:latest"
     image_pulled_time_less_than_default_time="ghcr.io/confidential-containers/test-container:rust-1.79.0" # unpacked size: 1.41GB
     large_image="quay.io/confidential-containers/test-images:largeimage" # unpacked size: 2.15GB
@@ -55,7 +56,7 @@ setup() {
     kubectl delete -f "$runc_pod_config"
 
     # 2. Create one kata pod with the $unencrypted_image image and nydus annotation
-    kata_pod_with_nydus_config="$(new_pod_config "$unencrypted_image" "kata-${KATA_HYPERVISOR}" \
+    kata_pod_with_nydus_config="$(new_pod_config "$unencrypted_image" "${runtime_class}" \
         "" "" "$unencrypted_image_supplemental_groups")"
     set_node "$kata_pod_with_nydus_config" "$node"
     set_container_command "$kata_pod_with_nydus_config" "0" "sleep" "30"
@@ -63,7 +64,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "$kata_pod_with_nydus_config" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $kata_pod_with_nydus_config file:"
@@ -81,14 +82,14 @@ setup() {
     # However, the unpacked size of image "ghcr.io/confidential-containers/test-container:rust-1.79.0" is 1.41GB.
     # It will fail to run the pod with pulling the image in the memory in the guest by default.
 
-    pod_config="$(new_pod_config "$image_pulled_time_less_than_default_time" "kata-${KATA_HYPERVISOR}")"
+    pod_config="$(new_pod_config "$image_pulled_time_less_than_default_time" "${runtime_class}")"
     set_node "$pod_config" "$node"
     set_container_command "$pod_config" "0" "sleep" "30"
 
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -104,10 +105,6 @@ setup() {
 @test "Test we can pull an image inside the guest using trusted storage" {
     # The image pulled in the guest will be downloaded and unpacked in the `/run/kata-containers/image` directory.
     # The tests will use `cryptsetup` to encrypt a block device and mount it at `/run/kata-containers/image`.
-
-    if [[ "$(uname -m)" == "s390x" ]] && [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]]; then
-        skip "skip large image pod tests on s390x zVSI due to insufficient CPU resources"
-    fi
 
     storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
@@ -142,7 +139,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -157,10 +154,6 @@ setup() {
 }
 
 @test "Test we cannot pull a large image that pull time exceeds createcontainer timeout inside the guest" {
-    if [[ "$(uname -m)" == "s390x" ]] && [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]]; then
-        skip "skip large image pod tests on s390x zVSI due to insufficient CPU resources"
-    fi
-
     storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
     PV_NAME=trusted-block-pv PVC_NAME=trusted-pvc \
@@ -189,7 +182,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -216,9 +209,6 @@ setup() {
 }
 
 @test "Test we can pull a large image inside the guest with large createcontainer timeout" {
-    if [[ "$(uname -m)" == "s390x" ]] && [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]]; then
-        skip "skip large image pod tests on s390x zVSI due to insufficient CPU resources"
-    fi
     if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [ "${KBS_INGRESS}" = "aks" ]; then
         skip "skip this specific one due to issue https://github.com/kata-containers/kata-containers/issues/10299"
     fi
@@ -251,7 +241,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"

@@ -108,7 +108,8 @@ add_runtime_handler_annotation_to_yaml() {
 	local -r yaml_file="$1"
 	if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
 		local -r handler_annotation="io.containerd.cri.runtime-handler"
-		local -r handler_value="kata-${KATA_HYPERVISOR}"
+		local handler_value
+		handler_value="$(get_test_runtime_class)"
 		add_annotations_to_yaml "${yaml_file}" "${handler_annotation}" "${handler_value}"
 	fi
 }
@@ -133,6 +134,9 @@ add_runtime_handler_annotations() {
 main() {
 	ensure_yq
 	reset_workloads_work_dir
+	# Default to the plain RuntimeClass; triage retries flip to debug on failure.
+	export KATA_TEST_RUNTIME_CLASS_MODE="${KATA_TEST_RUNTIME_CLASS_MODE:-plain}"
+	set_workloads_runtime_class "${runtimeclass_workloads_work_dir}"
 	add_runtime_handler_annotations
 }
 

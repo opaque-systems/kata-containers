@@ -46,6 +46,9 @@ pub use self::ch::{CloudHypervisorConfig, HYPERVISOR_NAME_CH};
 mod remote;
 pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
 
+mod openvmm;
+pub use self::openvmm::{OpenVmmConfig, HYPERVISOR_NAME_OPENVMM};
+
 mod rate_limiter;
 pub use self::rate_limiter::{RateLimiterConfig, DEFAULT_RATE_LIMITER_REFILL_TIME};
 
@@ -224,15 +227,6 @@ pub fn get_hypervisor_plugin(name: &str) -> Option<Arc<dyn ConfigPlugin>> {
 /// Configuration information for block device.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BlockDeviceInfo {
-    /// Disable block device from being used for a container's rootfs.
-    ///
-    /// In case of a storage driver like devicemapper where a container's root file system is
-    /// backed by a block device, the block device is passed directly to the hypervisor for
-    /// performance reasons. This flag prevents the block device from being passed to the
-    /// hypervisor, shared fs is used instead to pass the rootfs.
-    #[serde(default)]
-    pub disable_block_device_use: bool,
-
     /// Block storage driver to be used for the hypervisor in case the container rootfs is backed
     /// by a block device. Options include:
     /// - `virtio-scsi`
@@ -340,13 +334,6 @@ pub struct BlockDeviceInfo {
 impl BlockDeviceInfo {
     /// Adjust the configuration information after loading from configuration file.
     pub fn adjust_config(&mut self) -> Result<()> {
-        if self.disable_block_device_use {
-            self.block_device_driver = "".to_string();
-            self.enable_vhost_user_store = false;
-            self.memory_offset = 0;
-            return Ok(());
-        }
-
         if self.block_device_driver.is_empty() {
             self.block_device_driver = default::DEFAULT_BLOCK_DEVICE_TYPE.to_string();
         }
@@ -392,9 +379,6 @@ impl BlockDeviceInfo {
 
     /// Validate the configuration information.
     pub fn validate(&self) -> Result<()> {
-        if self.disable_block_device_use {
-            return Ok(());
-        }
         let l = [
             VIRTIO_BLK_PCI,
             VIRTIO_BLK_CCW,
@@ -681,6 +665,12 @@ pub struct CpuInfo {
     /// - On ARM with GICv2, max is 8
     #[serde(default)]
     pub default_maxvcpus: u32,
+
+    /// Disables nested virtualization in the guest for Cloud Hypervisor.
+    ///
+    /// If unspecified, the option is omitted from the Cloud Hypervisor configuration.
+    #[serde(default)]
+    pub disable_nested_virtualization: Option<bool>,
 }
 
 impl CpuInfo {
@@ -1408,8 +1398,7 @@ pub struct SecurityInfo {
 
     /// Qemu seccomp sandbox feature
     /// comma-separated list of seccomp sandbox features to control the syscall access.
-    /// For example, `seccompsandbox= "on,obsolete=deny,spawn=deny,resourcecontrol=deny"`
-    /// Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
+    /// For example, `seccomp_sandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"`
     /// Another note: enabling this feature may reduce performance, you may enable
     /// /proc/sys/net/core/bpf_jit_enable to reduce the impact. see https://man7.org/linux/man-pages/man8/bpfc.8.html
     pub seccomp_sandbox: Option<String>,
@@ -2043,12 +2032,14 @@ mod tests {
                     default_vcpus: 0.0,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: 0,
+                    disable_nested_virtualization: None,
                 },
                 output: CpuInfo {
                     cpu_features: "".to_string(),
                     default_vcpus,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: node_cpus as u32,
+                    disable_nested_virtualization: None,
                 },
             },
             TestData {
@@ -2058,12 +2049,14 @@ mod tests {
                     default_vcpus: 9999999.0,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: 9999999,
+                    disable_nested_virtualization: None,
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: node_cpus,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: node_cpus as u32,
+                    disable_nested_virtualization: None,
                 },
             },
             TestData {
@@ -2073,12 +2066,14 @@ mod tests {
                     default_vcpus: -1.0,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: 1,
+                    disable_nested_virtualization: None,
                 },
                 output: CpuInfo {
                     cpu_features: "a,b,c".to_string(),
                     default_vcpus: 1.0,
                     overhead_vcpus: 0.0,
                     default_maxvcpus: 1,
+                    disable_nested_virtualization: None,
                 },
             },
             TestData {
@@ -2088,12 +2083,14 @@ mod tests {
                     default_vcpus: 0.0,
                     overhead_vcpus: 0.5,
                     default_maxvcpus: 2,
+                    disable_nested_virtualization: None,
                 },
                 output: CpuInfo {
                     cpu_features: "x,y".to_string(),
                     default_vcpus,
                     overhead_vcpus: 0.5,
                     default_maxvcpus: 2,
+                    disable_nested_virtualization: None,
                 },
             },
         ];

@@ -9,13 +9,7 @@ MK_DIR := $(dir $(MK_PATH))
 # Verbose build
 V := 1
 
-ifeq ($(CROSS_BUILD),)
-	CROSS_BUILD = false
-endif
-
-ifeq ($(CROSS_BUILD),false)
-	ARCH := $(shell uname -m)
-endif
+ARCH := $(shell uname -m)
 
 ifeq ($(ARCH), x86_64)
 BASE_TARBALLS = serial-targets \
@@ -28,6 +22,7 @@ BASE_TARBALLS = serial-targets \
 	ovmf-sev-tarball \
 	ovmf-tdx-tarball \
 	ovmf-tarball \
+	qemu-no-shared-fs-tarball \
 	qemu-snp-experimental-tarball \
 	qemu-tdx-experimental-tarball \
 	qemu-tarball \
@@ -35,26 +30,23 @@ BASE_TARBALLS = serial-targets \
 	shim-v2-go-tarball \
 	shim-v2-rust-tarball \
 	virtiofsd-tarball
-BASE_SERIAL_TARBALLS = rootfs-image-tarball \
+BASE_SERIAL_TARBALLS = openvmm-tarball \
+	rootfs-image-tarball \
 	rootfs-image-confidential-tarball \
 	rootfs-image-coco-extension-tarball \
+	rootfs-image-devkit-extension-tarball \
 	rootfs-image-mariner-tarball \
+	rootfs-image-nvidia-gpu-tarball \
+	rootfs-image-nvidia-gpu-confidential-tarball \
+	rootfs-image-nvidia-tarball \
+	rootfs-image-nvidia-gpu-extension-tarball \
 	rootfs-initrd-confidential-tarball \
 	rootfs-initrd-tarball \
 	cloud-hypervisor-tarball
 else ifeq ($(ARCH), s390x)
 BASE_TARBALLS = serial-targets \
-	kernel-debug-tarball \
-	kernel-tarball \
-	qemu-tarball \
-	shim-v2-go-tarball \
-	shim-v2-rust-tarball \
-	virtiofsd-tarball
-BASE_SERIAL_TARBALLS = rootfs-image-tarball \
-	rootfs-image-coco-extension-tarball \
-	rootfs-initrd-tarball
-else ifeq ($(ARCH), aarch64)
-BASE_TARBALLS = serial-targets \
+	boot-image-se-tarball \
+	boot-image-se-runtime-rs-tarball \
 	kernel-debug-tarball \
 	kernel-tarball \
 	qemu-tarball \
@@ -64,12 +56,48 @@ BASE_TARBALLS = serial-targets \
 BASE_SERIAL_TARBALLS = rootfs-image-tarball \
 	rootfs-image-confidential-tarball \
 	rootfs-image-coco-extension-tarball \
+	rootfs-initrd-confidential-tarball \
 	rootfs-initrd-tarball
+else ifeq ($(ARCH), aarch64)
+BASE_TARBALLS = serial-targets \
+	firecracker-tarball \
+	kernel-debug-tarball \
+	kernel-dragonball-experimental-tarball \
+	kernel-tarball \
+	nydus-tarball \
+	ovmf-tarball \
+	qemu-no-shared-fs-tarball \
+	qemu-tarball \
+	shim-v2-go-tarball \
+	shim-v2-rust-tarball \
+	virtiofsd-tarball
+BASE_SERIAL_TARBALLS = openvmm-tarball \
+	rootfs-image-tarball \
+	rootfs-image-confidential-tarball \
+	rootfs-image-coco-extension-tarball \
+	rootfs-image-devkit-extension-tarball \
+	rootfs-image-nvidia-gpu-tarball \
+	rootfs-image-nvidia-tarball \
+	rootfs-image-nvidia-gpu-extension-tarball \
+	rootfs-initrd-tarball \
+	cloud-hypervisor-tarball
+else ifeq ($(ARCH), ppc64le)
+BASE_TARBALLS = serial-targets \
+	kernel-tarball \
+	qemu-tarball \
+	shim-v2-go-tarball \
+	virtiofsd-tarball
+BASE_SERIAL_TARBALLS = rootfs-initrd-tarball
+endif
+
+ifeq ($(ARCH), ppc64le)
+SHIM_TARBALLS = shim-v2-go-tarball
+else
+SHIM_TARBALLS = shim-v2-go-tarball shim-v2-rust-tarball
 endif
 
 PUBLISH_COMPONENT_TARBALLS = \
 	kata-deploy-binary-tarball \
-	kata-deploy-job-dispatcher-tarball \
 	nydus-snapshotter-for-coco-guest-pull-tarball
 
 ifeq ($(ARCH), x86_64)
@@ -84,6 +112,7 @@ NVGPU_BASE_TARBALLS = \
 	ovmf-tdx-tarball \
 	ovmf-tarball \
 	pause-image-tarball \
+	qemu-no-shared-fs-tarball \
 	qemu-snp-experimental-tarball \
 	qemu-tdx-experimental-tarball \
 	qemu-tarball \
@@ -98,6 +127,7 @@ NVGPU_BASE_TARBALLS = \
 	kernel-nvidia-gpu-tarball \
 	ovmf-tarball \
 	pause-image-tarball \
+	qemu-no-shared-fs-tarball \
 	qemu-tarball \
 	virtiofsd-tarball \
 	serial-targets
@@ -106,13 +136,13 @@ endif
 # can consume a single nvgpu bundle without rebuilding extra components.
 NVGPU_FINAL_TARBALL_INPUTS = \
 	kata-deploy-static-kata-deploy-binary.tar.zst \
-	kata-deploy-static-kata-deploy-job-dispatcher.tar.zst \
 	kata-deploy-static-nydus-snapshotter-for-coco-guest-pull.tar.zst \
 	kata-static-kernel-nvidia-gpu.tar.zst \
 	kata-static-ovmf-sev.tar.zst \
 	kata-static-ovmf-tdx.tar.zst \
 	kata-static-ovmf.tar.zst \
 	kata-static-pause-image.tar.zst \
+	kata-static-qemu-no-shared-fs.tar.zst \
 	kata-static-qemu-snp-experimental.tar.zst \
 	kata-static-qemu-tdx-experimental.tar.zst \
 	kata-static-qemu.tar.zst \
@@ -129,7 +159,7 @@ ifneq ($(NVGPU_BASE_TARBALLS),)
 nvgpu-tarball:
 	${MAKE} -f $(MK_PATH) kata-tarball \
 		BASE_TARBALLS="$(NVGPU_BASE_TARBALLS)" \
-		BASE_SERIAL_TARBALLS="rootfs-image-nvidia-gpu-tarball rootfs-image-nvidia-gpu-confidential-tarball rootfs-image-nvidia-tarball rootfs-image-nvidia-gpu-extension-tarball" \
+		BASE_SERIAL_TARBALLS="rootfs-image-nvidia-gpu-tarball rootfs-image-nvidia-gpu-confidential-tarball rootfs-image-nvidia-tarball" \
 		FINAL_TARBALL_INPUTS="$(NVGPU_FINAL_TARBALL_INPUTS)" \
 		FINAL_TARBALL_MERGE_MODE=passthrough \
 		DEPS=
@@ -151,7 +181,35 @@ define DUMMY
 	mv $(MK_DIR)/build/kata-static-dummy.tar.zst $(MK_DIR)/build/kata-static-$(patsubst %-tarball,%,$1).tar.zst
 endef
 
+ifneq ($(filter $(ARCH),x86_64 aarch64 s390x ppc64le),)
+KATA_STATIC_FINAL_TARBALL_INPUTS := $(shell $(MK_DIR)/kata-release-tarball-inputs.sh kata-static $(ARCH) | tr '\n' ' ')
+KATA_GO_STATIC_FINAL_TARBALL_INPUTS := $(shell $(MK_DIR)/kata-release-tarball-inputs.sh kata-go-static $(ARCH) | tr '\n' ' ')
+endif
+
+ifneq ($(KATA_STATIC_FINAL_TARBALL_INPUTS),)
+kata-tarball: FINAL_TARBALL_INPUTS=$(KATA_STATIC_FINAL_TARBALL_INPUTS)
+kata-tarball: FINAL_TARBALL_NAME=kata-static.tar.zst
+kata-tarball: | all-parallel
+	$(MAKE) -f $(MK_PATH) merge-builds \
+		FINAL_TARBALL_NAME="$(FINAL_TARBALL_NAME)" \
+		FINAL_TARBALL_INPUTS="$(FINAL_TARBALL_INPUTS)" \
+		FINAL_TARBALL_MERGE_MODE="$(FINAL_TARBALL_MERGE_MODE)"
+else
 kata-tarball: | all-parallel merge-builds
+endif
+
+ifneq ($(KATA_GO_STATIC_FINAL_TARBALL_INPUTS),)
+kata-go-static-tarball: FINAL_TARBALL_INPUTS=$(KATA_GO_STATIC_FINAL_TARBALL_INPUTS)
+kata-go-static-tarball: FINAL_TARBALL_NAME=kata-go-static.tar.zst
+kata-go-static-tarball: | all-parallel
+	$(MAKE) -f $(MK_PATH) merge-builds \
+		FINAL_TARBALL_NAME="$(FINAL_TARBALL_NAME)" \
+		FINAL_TARBALL_INPUTS="$(FINAL_TARBALL_INPUTS)" \
+		FINAL_TARBALL_MERGE_MODE="$(FINAL_TARBALL_MERGE_MODE)"
+else
+kata-go-static-tarball:
+	@echo "kata-go-static-tarball: unsupported on $(ARCH)"; exit 1
+endif
 
 copy-scripts-for-the-agent-build:
 	${MK_DIR}/kata-deploy-copy-libseccomp-installer.sh "agent"
@@ -161,7 +219,7 @@ copy-scripts-for-the-tools-build:
 
 all-parallel:
 	${MAKE} -f $(MK_PATH) all -j $(shell nproc) --output-sync=target V=
-	${MAKE} -f $(MK_PATH) shim-v2-go-tarball shim-v2-rust-tarball V=
+	${MAKE} -f $(MK_PATH) $(SHIM_TARBALLS) V=
 
 all: ${BASE_TARBALLS}
 
@@ -170,8 +228,9 @@ serial-targets: $(filter-out serial-targets,$(BASE_TARBALLS))
 	${BASE_SERIAL_TARBALLS}
 
 # Optional explicit allowlist for merge-builds input tarballs.
-# Keep empty for normal targets; set explicitly for NVIDIA flow.
+# Release and NVIDIA targets set this to keep their contents deterministic.
 FINAL_TARBALL_INPUTS ?=
+FINAL_TARBALL_NAME ?= kata-static.tar.zst
 
 %-tarball-build:
 	$(call BUILD,$*)
@@ -190,6 +249,9 @@ coco-guest-components-tarball:
 	${MAKE} $@-build
 
 cloud-hypervisor-tarball:
+	${MAKE} $@-build
+
+openvmm-tarball:
 	${MAKE} $@-build
 
 firecracker-tarball:
@@ -234,6 +296,9 @@ ovmf-tdx-tarball:
 ovmf-tarball:
 	${MAKE} $@-build
 
+qemu-no-shared-fs-tarball:
+	${MAKE} $@-build
+
 qemu-snp-experimental-tarball:
 	${MAKE} $@-build
 
@@ -253,6 +318,14 @@ endif
 boot-image-se-tarball: $(DEPS)
 	${MAKE} $@-build
 
+ifeq ($(FAKE_SE_IMAGE),true)
+DEPS :=
+else
+DEPS := kernel-tarball rootfs-initrd-tarball rootfs-image-coco-extension-tarball
+endif
+boot-image-se-runtime-rs-tarball: $(DEPS)
+	${MAKE} $@-build
+
 stratovirt-tarball:
 	${MAKE} $@-build
 
@@ -264,8 +337,13 @@ DEPS := agent-tarball pause-image-tarball coco-guest-components-tarball kernel-t
 rootfs-image-confidential-tarball: $(DEPS)
 	${MAKE} $@-build
 
-DEPS := pause-image-tarball coco-guest-components-tarball
-rootfs-image-coco-extension-tarball: $(DEPS)
+rootfs-image-coco-extension-tarball:
+	${MAKE} $@-build
+
+# Self-contained debug rootfs (no kata-agent, kernel or driver tree), so it has
+# no build-time dependency on any other target.
+DEPS :=
+rootfs-image-devkit-extension-tarball: $(DEPS)
 	${MAKE} $@-build
 
 DEPS := agent-tarball
@@ -288,14 +366,15 @@ DEPS := agent-tarball busybox-tarball pause-image-tarball coco-guest-components-
 rootfs-image-nvidia-gpu-confidential-tarball: $(DEPS)
 	${MAKE} $@-build
 
-# Composable NVIDIA stack: the driver-agnostic nvidia boot image and the
-# driver-versioned gpu extension are both carved out of the same chiseled tree, so
-# they share the monolith's (non-confidential) build dependencies.
+# The driver-agnostic nvidia base is still carved from the chiseled monolith tree,
+# so it keeps the monolith's (non-confidential) build dependencies.
 DEPS := agent-tarball busybox-tarball kernel-nvidia-gpu-tarball
 rootfs-image-nvidia-tarball: $(DEPS)
 	${MAKE} $@-build
 
-DEPS := agent-tarball busybox-tarball kernel-nvidia-gpu-tarball
+# The gpu extension is assembled directly from the package-installed rootfs and
+# ships neither the agent nor NVRC/busybox; it only needs the Kata NVIDIA modules.
+DEPS := kernel-nvidia-gpu-tarball
 rootfs-image-nvidia-gpu-extension-tarball: $(DEPS)
 	${MAKE} $@-build
 
@@ -314,9 +393,6 @@ virtiofsd-tarball:
 kata-deploy-binary-tarball:
 	$(call BUILD_KATA_DEPLOY_COMPONENT,kata-deploy-binary)
 
-kata-deploy-job-dispatcher-tarball:
-	$(call BUILD_KATA_DEPLOY_COMPONENT,kata-deploy-job-dispatcher)
-
 nydus-snapshotter-for-coco-guest-pull-tarball:
 	$(call BUILD_KATA_DEPLOY_COMPONENT,nydus-snapshotter-for-coco-guest-pull)
 
@@ -326,7 +402,7 @@ merge-builds:
 	$(MK_DIR)/kata-deploy-merge-builds.sh \
 		build \
 		"$(MK_DIR)/../../../../versions.yaml" \
-		kata-static.tar.zst \
+		"$(FINAL_TARBALL_NAME)" \
 		"$(FINAL_TARBALL_INPUTS)" \
 		"$(FINAL_TARBALL_MERGE_MODE)"
 
@@ -334,7 +410,10 @@ merge-builds:
 install-prebuilt-artifacts:
 	mv kata-artifacts $(MK_DIR)/build
 
+# The payload is unpacked straight onto this machine's root, so vet it first:
+# a stray etc/resolv.conf in there would replace the local resolver.
 install-tarball:
+	$(MK_DIR)/../../scripts/assert-tarball-host-safe.sh ./kata-static.tar.zst
 	tar --zstd -xf ./kata-static.tar.zst -C /
 
 # Push the kata-deploy image and helm chart for the host arch. Caller is

@@ -42,17 +42,7 @@ fi
 
 rust_builder_tar="${build_dir}/kata-deploy-binary-out.tar"
 
-# kata-deploy and kata-deploy-job-dispatcher are produced by the same rust-builder
-# stage. Build it once *per process* and let each component package its own
-# binary, so running both components in a single invocation does not compile the
-# workspace twice. The guard is process-local (not a directory check) on purpose:
-# a fresh invocation must always rebuild, otherwise a stale output tar from an
-# earlier run/commit would be silently reused.
-rust_binaries_built="false"
-build_rust_binaries() {
-	if [[ "${rust_binaries_built}" == "true" ]]; then
-		return
-	fi
+build_kata_deploy_binary() {
 	rm -f "${rust_builder_tar}"
 	docker buildx build \
 		--target rust-builder \
@@ -60,11 +50,6 @@ build_rust_binaries() {
 		--output "type=tar,dest=${rust_builder_tar}" \
 		-f "${repo_root_dir}/tools/packaging/kata-deploy/Dockerfile.components" \
 		"${repo_root_dir}"
-	rust_binaries_built="true"
-}
-
-build_kata_deploy_binary() {
-	build_rust_binaries
 
 	mkdir -p "${build_dir}/kata-deploy-binary/usr/bin"
 	tar -xf "${rust_builder_tar}" -C "${build_dir}/kata-deploy-binary/usr/bin" \
@@ -73,21 +58,12 @@ build_kata_deploy_binary() {
 		-C "${build_dir}/kata-deploy-binary" .
 }
 
-build_kata_deploy_job_dispatcher() {
-	build_rust_binaries
-
-	mkdir -p "${build_dir}/kata-deploy-job-dispatcher/usr/bin"
-	tar -xf "${rust_builder_tar}" -C "${build_dir}/kata-deploy-job-dispatcher/usr/bin" \
-		--strip-components=2 kata-deploy/bin/kata-deploy-job-dispatcher
-	kata_tar_zstd -cf "${build_dir}/kata-deploy-static-kata-deploy-job-dispatcher.tar.zst" \
-		-C "${build_dir}/kata-deploy-job-dispatcher" .
-}
-
 build_nydus_snapshotter_for_coco_guest_pull() {
-	# STATIC_RUNTIME=yes is the umbrella flag for a musl-compatible payload: it
-	# builds the kata Go host binaries static (see static-build/shim-v2) and here
-	# pulls the statically linked nydus-snapshotter binaries instead of the
-	# glibc-linked per-arch ones.
+	# The kata Go host binaries are built static by default (see
+	# static-build/shim-v2). STATIC_RUNTIME=yes additionally pulls the
+	# statically linked nydus-snapshotter binaries instead of the glibc-linked
+	# per-arch ones, producing a fully musl-compatible payload. The static
+	# nydus asset is published for amd64 only.
 	local static_nydus_snapshotter="${STATIC_RUNTIME:-}"
 
 	docker buildx build \
@@ -108,15 +84,13 @@ build_nydus_snapshotter_for_coco_guest_pull() {
 
 case "${component}" in
 	kata-deploy-binary) build_kata_deploy_binary ;;
-	kata-deploy-job-dispatcher) build_kata_deploy_job_dispatcher ;;
 	nydus-snapshotter-for-coco-guest-pull) build_nydus_snapshotter_for_coco_guest_pull ;;
 	all)
 		build_kata_deploy_binary
-		build_kata_deploy_job_dispatcher
 		build_nydus_snapshotter_for_coco_guest_pull
 		;;
 	*)
-		echo "Unknown component '${component}'. Expected: kata-deploy-binary, kata-deploy-job-dispatcher, nydus-snapshotter-for-coco-guest-pull, all" >&2
+		echo "Unknown component '${component}'. Expected: kata-deploy-binary, nydus-snapshotter-for-coco-guest-pull, all" >&2
 		exit 1
 		;;
 esac

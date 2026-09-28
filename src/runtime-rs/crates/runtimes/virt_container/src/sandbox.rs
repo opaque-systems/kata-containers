@@ -5,6 +5,7 @@
 //
 
 use crate::health_check::HealthCheck;
+use crate::oom::CrioOomNotifier;
 use agent::kata::KataAgent;
 use agent::types::{KernelModule, SetPolicyRequest};
 use agent::{
@@ -33,7 +34,6 @@ use hypervisor::ch::CloudHypervisor;
 use hypervisor::device::topology::PCIePort;
 use hypervisor::device::util::{get_host_path, DEVICE_TYPE_CHAR};
 use hypervisor::remote::Remote;
-use hypervisor::{BlockConfigModern, Hypervisor, VfioDeviceBase, is_vfio_ap_device};
 use hypervisor::VsockConfig;
 use hypervisor::HYPERVISOR_REMOTE;
 #[cfg(all(
@@ -43,9 +43,17 @@ use hypervisor::HYPERVISOR_REMOTE;
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
+use hypervisor::{is_vfio_ap_device, BlockConfigModern, Hypervisor, VfioDeviceBase};
+#[cfg(all(
+    feature = "openvmm",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use hypervisor::{openvmm::OpenVmm, HYPERVISOR_NAME_OPENVMM};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{
-    utils::{get_hvsock_path, uses_native_ccw_bus},
+    utils::{
+        get_hvsock_path, remove_vmm_user_runtime_dir, uses_native_ccw_bus, vmm_user_runtime_dir,
+    },
     HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID,
 };
 use hypervisor::{BlockDeviceAio, PortDeviceConfig};
@@ -144,6 +152,7 @@ pub struct VirtSandbox {
     shm_size: u64,
     factory: Option<Factory>,
     cancel_token: CancellationToken,
+    oom_notifier: Arc<CrioOomNotifier>,
 }
 
 impl std::fmt::Debug for VirtSandbox {
@@ -190,7 +199,15 @@ impl VirtSandbox {
             sandbox_config: Some(sandbox_config),
             factory: Some(factory),
             cancel_token,
+            oom_notifier: Arc::new(CrioOomNotifier::default()),
         })
+    }
+
+    /// The sandbox watches for OOM events but only the container manager knows
+    /// the bundle each container was created with, which is where CRI-O looks
+    /// for word of one.
+    pub fn oom_notifier(&self) -> Arc<CrioOomNotifier> {
+        self.oom_notifier.clone()
     }
 
     pub fn get_agent(&self) -> Arc<dyn Agent> {
@@ -236,16 +253,17 @@ impl VirtSandbox {
 
         let network_env: SandboxNetworkEnv = sandbox_config.network_env.clone();
         // prepare network config
-        if !network_env.network_created {
+        if !network_env.network_created && !self.should_defer_network().await? {
             if let Some(network_resource) = self.prepare_network_resource(&network_env).await {
                 resource_configs.push(network_resource);
             }
         }
 
         // prepare sharefs device config
-        let virtio_fs_config =
-            ResourceConfig::ShareFs(self.hypervisor.hypervisor_config().await.shared_fs);
-        resource_configs.push(virtio_fs_config);
+        let shared_fs = self.hypervisor.hypervisor_config().await.shared_fs;
+        if shared_fs.shared_fs.is_some() {
+            resource_configs.push(ResourceConfig::ShareFs(shared_fs));
+        }
 
         // prepare VM rootfs device config
         if let Some(block_config) = self
@@ -863,6 +881,8 @@ impl VirtSandbox {
             is_readonly: true,
             driver_option: block_driver.clone(),
             blkdev_aio: BlockDeviceAio::Native,
+            num_queues: hypervisor_config.blockdev_info.num_queues,
+            queue_size: hypervisor_config.blockdev_info.queue_size,
             ..Default::default()
         };
         let initdata_config = InitDataConfig(block_config, initdata_digest);
@@ -877,6 +897,42 @@ impl VirtSandbox {
         create_runtime_hooks: &[oci::Hook],
     ) -> bool {
         !prestart_hooks.is_empty() || !create_runtime_hooks.is_empty()
+    }
+
+    fn is_factory_enabled(&self) -> bool {
+        self.factory
+            .as_ref()
+            .map(|factory| factory.enable_template)
+            .unwrap_or(false)
+    }
+
+    async fn should_defer_network(&self) -> Result<bool> {
+        if !self.is_factory_enabled() {
+            return Ok(false);
+        }
+
+        Ok(self
+            .hypervisor
+            .capabilities()
+            .await?
+            .is_network_device_hotplug_supported())
+    }
+
+    async fn setup_deferred_network_after_start(
+        &self,
+        sandbox_config: &SandboxConfig,
+    ) -> Result<()> {
+        if let Some(ResourceConfig::Network(network_resource)) = self
+            .prepare_network_resource(&sandbox_config.network_env)
+            .await
+        {
+            self.resource_manager
+                .handle_network(network_resource)
+                .await
+                .context("set up factory network after start vm")?;
+        }
+
+        Ok(())
     }
 
     /// Build a network rescan config targeting the hypervisor's network
@@ -978,6 +1034,8 @@ impl Sandbox for VirtSandbox {
             .await
             .context("prepare vm")?;
 
+        let defer_network = self.should_defer_network().await?;
+
         // generate device and setup before start vm
         // should after hypervisor.prepare_vm
         let resources = self.prepare_for_start_sandbox(id, sandbox_config).await?;
@@ -1028,9 +1086,12 @@ impl Sandbox for VirtSandbox {
         // 1. if there are pre-start hook functions, network config might have been changed.
         //    We need to rescan the netns to handle the change.
         // 2. Do not scan the netns if we want no network for the VM.
-        // TODO In case of vm factory, scan the netns to hotplug interfaces after the VM is started.
+        // QEMU and Cloud Hypervisor advertise network hotplug support, so
+        // factory VMs using them defer network setup until after VM startup.
+        // Backends without this capability retain pre-start setup.
         let config = self.resource_manager.config().await;
         if self.has_prestart_hooks(&prestart_hooks, &create_runtime_hooks)
+            && !defer_network
             && !config.runtime.disable_new_netns
             && !dan_config_path(&config, &self.sid).exists()
         {
@@ -1051,6 +1112,11 @@ impl Sandbox for VirtSandbox {
                     .await
                     .context("set up device after start vm")?;
             }
+        }
+
+        if defer_network {
+            self.setup_deferred_network_after_start(sandbox_config)
+                .await?;
         }
 
         // connect agent
@@ -1109,6 +1175,7 @@ impl Sandbox for VirtSandbox {
         let agent = self.agent.clone();
         let sender = self.msg_sender.clone();
         let cancel_token = self.cancel_token.clone();
+        let oom_notifier = self.oom_notifier.clone();
 
         info!(sl!(), "oom watcher start");
         tokio::spawn(async move {
@@ -1124,6 +1191,8 @@ impl Sandbox for VirtSandbox {
                             Ok(resp) => {
                                 let cid = &resp.container_id;
                                 warn!(sl!(), "send oom event for container {}", &cid);
+                                // CRI-O reads a file rather than the event below.
+                                oom_notifier.notify(cid).await;
                                 let event = TaskOOM {
                                     container_id: cid.to_string(),
                                     ..Default::default()
@@ -1323,6 +1392,14 @@ impl Sandbox for VirtSandbox {
             inner.cleaned = true;
         }
 
+        let rootless_uid = self
+            .hypervisor
+            .hypervisor_config()
+            .await
+            .security_info
+            .rootless_user
+            .map(|user| user.uid);
+
         info!(sl!(), "delete hypervisor");
         self.hypervisor
             .cleanup()
@@ -1334,6 +1411,18 @@ impl Sandbox for VirtSandbox {
             .cleanup()
             .await
             .context("resource clean up")?;
+
+        if let Some(uid) = rootless_uid {
+            let path = vmm_user_runtime_dir(uid);
+            if let Err(err) = remove_vmm_user_runtime_dir(uid) {
+                warn!(
+                    sl!(),
+                    "failed to remove rootless runtime directory {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
 
         // TODO: cleanup other sandbox resource
         Ok(())
@@ -1494,6 +1583,11 @@ impl Persist for VirtSandbox {
                 HYPERVISOR_FIRECRACKER => Ok(Some(hypervisor_state)),
                 HYPERVISOR_QEMU => Ok(Some(hypervisor_state)),
                 HYPERVISOR_REMOTE => Ok(Some(hypervisor_state)),
+                #[cfg(all(
+                    feature = "openvmm",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
+                HYPERVISOR_NAME_OPENVMM => Ok(Some(hypervisor_state)),
                 _ => Err(anyhow!(
                     "Unsupported hypervisor {}",
                     hypervisor_state.hypervisor_type
@@ -1556,6 +1650,14 @@ impl Persist for VirtSandbox {
                 let hypervisor = Arc::new(Remote::restore((), h).await?) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
+            #[cfg(all(
+                feature = "openvmm",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            HYPERVISOR_NAME_OPENVMM => {
+                let hypervisor = Arc::new(OpenVmm::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
             _ => Err(anyhow!("Unsupported hypervisor {}", &h.hypervisor_type)),
         }?;
         let agent = Arc::new(KataAgent::new(kata_types::config::Agent::default()));
@@ -1581,6 +1683,9 @@ impl Persist for VirtSandbox {
             shm_size: DEFAULT_SHM_SIZE,
             factory: None,
             cancel_token: CancellationToken::default(),
+            // A restored sandbox is handed back its containers by the shim, so
+            // this starts out empty and fills up as they are created again.
+            oom_notifier: Arc::new(CrioOomNotifier::default()),
         })
     }
 }

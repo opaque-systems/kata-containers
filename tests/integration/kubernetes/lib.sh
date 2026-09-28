@@ -168,6 +168,69 @@ exec_host() {
 	kubectl exec -qi -n kube-system "${pod_name}" -- chroot /host bash -c "${command}" | tr -d '\r'
 }
 
+# Return the sandbox id of a pod, as the container runtime knows it. For Kata
+# that is also the id the shim, the guest and kata-ctl go by.
+#
+# Only ready sandboxes count: a pod name can be reused once the pod that had it
+# is gone, and the runtime remembers the dead sandbox for a while afterwards.
+#
+# Parameters:
+#	$1 - pod name in the current Kubernetes namespace
+get_pod_sandbox_id() {
+	local pod_name="$1"
+	local node
+	local runtime
+	local runtime_endpoint
+
+	node="$(kubectl get pod "${pod_name}" -o jsonpath='{.spec.nodeName}')"
+	[[ -n "${node}" ]] || die "No node found for pod ${pod_name}"
+	exec_host "${node}" "command -v crictl >/dev/null" || \
+		die "crictl is required on Kubernetes node ${node}"
+
+	runtime="$(exec_host "${node}" "crictl version | grep 'RuntimeName:' | awk '{print  \$2}'")"
+	if [[ "${runtime}" == "cri-o" ]]; then
+		runtime_endpoint="unix:///run/crio/crio.sock"
+	else
+		runtime_endpoint="unix:///run/containerd/containerd.sock"
+	fi
+	exec_host "${node}" \
+		"crictl --runtime-endpoint ${runtime_endpoint} \
+		pods --name \"${pod_name}\" --state ready -q | head -1"
+}
+
+# Return the VMM PID for a running pod.
+#
+# Parameters:
+#	$1 - pod name in the current Kubernetes namespace
+get_vmm_pid_for_pod() {
+	local pod_name="$1"
+	local node
+	local sandbox_id
+	local vmm_pattern
+	local vmm_pid
+
+	# shellcheck disable=SC2154 # supplied by the Kubernetes test environment
+	case "${KATA_HYPERVISOR}" in
+		qemu*) vmm_pattern="[q]emu" ;;
+		clh*) vmm_pattern="[c]loud-hypervisor" ;;
+		*)
+			die "VMM PID lookup is only tested for QEMU and Cloud Hypervisor"
+			;;
+	esac
+
+	sandbox_id="$(get_pod_sandbox_id "${pod_name}")"
+	[[ -n "${sandbox_id}" ]] || die "No sandbox ID found for pod ${pod_name}"
+
+	node="$(kubectl get pod "${pod_name}" -o jsonpath='{.spec.nodeName}')"
+	[[ -n "${node}" ]] || die "No node found for pod ${pod_name}"
+
+	vmm_pid="$(exec_host "${node}" \
+		"pgrep -f \"${vmm_pattern}.*${sandbox_id}\" | head -1")"
+	[[ -n "${vmm_pid}" ]] || die "No VMM PID found for sandbox ${sandbox_id}"
+
+	echo "${vmm_pid}"
+}
+
 # Check the logged messages on host have a given message.
 #
 # Parameters:
@@ -414,6 +477,18 @@ set_metadata_annotation() {
 			>&2 echo "ERROR: IBM_SE_CREDS_DIR is empty"
 			return 1
 		fi
+		if [[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ]]; then
+			export SE_COMPOSABLE="yes"
+			# Seed the CoCo extension verity params so the rebuilt SE image seals
+			# the actual root hash into its kernel cmdline.  The file is absent on
+			# s390x (unmeasured extension); the bare-key fallback in lib_se.sh
+			# handles that case correctly.
+			local root_hash_file="/opt/kata/share/kata-containers/root_hash_coco-extension.txt"
+			if [[ -f "${root_hash_file}" ]]; then
+				COCO_VERITY_PARAMS="$(< "${root_hash_file}")"
+				export COCO_VERITY_PARAMS
+			fi
+		fi
 		repack_secure_image "${value}" "${IBM_SE_CREDS_DIR}" "true"
 	fi
 }
@@ -461,30 +536,4 @@ set_node() {
   yq -i \
     "${spec} = \"${node}\"" \
     "${yaml}"
-}
-
-# Get the sandbox id for kata container from a worker node
-#
-# Parameters:
-#	$1 - the k8s worker node name
-#
-get_node_kata_sandbox_id() {
-	local node="$1"
-	local kata_sandbox_id=""
-	local local_wait_time="${wait_time}"
-	# Max loop 3 times to get kata_sandbox_id
-	while [[ "${local_wait_time}" -gt 0 ]];
-	do
-		kata_sandbox_id=$(exec_host "${node}" "ps -ef |\
-		  grep containerd-shim-kata-v2" |\
-		  grep -oP '(?<=-id\s)[a-f0-9]+' |\
-		  tail -1)
-		if [[ -n "${kata_sandbox_id}" ]]; then
-			break
-		else
-			sleep "${sleep_time}"
-			local_wait_time=$((local_wait_time-sleep_time))
-		fi
-	done
-	echo "${kata_sandbox_id}"
 }

@@ -205,7 +205,7 @@ func TestHandleEphemeralStorage(t *testing.T) {
 	assert.Nil(t, err)
 
 	epheMountPoint := epheStorages[0].MountPoint
-	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
+	expected := filepath.Join(defaultEphemeralPath, filepath.Base(mountSource))
 	assert.Equal(t, epheMountPoint, expected,
 		"Ephemeral mount point didn't match: got %s, expecting %s", epheMountPoint, expected)
 }
@@ -727,7 +727,7 @@ func TestHandleShm(t *testing.T) {
 	assert.NotEmpty(ociMounts[0].Destination)
 	assert.Equal(ociMounts[0].Destination, "/dev/shm")
 	assert.Equal(ociMounts[0].Type, "bind")
-	assert.NotEmpty(ociMounts[0].Source, filepath.Join(kataGuestSharedDir(), shmDir))
+	assert.Equal(filepath.Join(defaultKataGuestSandboxDir, shmDir), ociMounts[0].Source)
 	assert.Equal(ociMounts[0].Options, []string{"rbind"})
 
 	sandbox.shmSize = 0
@@ -755,7 +755,7 @@ func TestHandleShm(t *testing.T) {
 	assert.Nil(err)
 
 	epheMountPoint := epheStorages[0].MountPoint
-	expected := filepath.Join(ephemeralPath(), filepath.Base(mountSource))
+	expected := filepath.Join(defaultEphemeralPath, filepath.Base(mountSource))
 	assert.Equal(epheMountPoint, expected,
 		"Ephemeral mount point didn't match: got %s, expecting %s", epheMountPoint, expected)
 
@@ -1235,19 +1235,17 @@ func TestKataAgentDirs(t *testing.T) {
 	uidmap := strings.Fields(string(line))
 	expectedRootless := (uidmap[0] == "0" && uidmap[1] != "0")
 	assert.Equal(expectedRootless, rootless.IsRootless())
+	assert.Equal(defaultKataGuestSandboxDir, kataGuestSandboxDir())
+	assert.Equal(defaultEphemeralPath, ephemeralPath())
 	if expectedRootless {
 		assert.Equal(kataHostSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSharedDir)
-		assert.Equal(kataGuestSandboxDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestSandboxDir)
-		assert.Equal(ephemeralPath(), os.Getenv("XDG_RUNTIME_DIR")+defaultEphemeralPath)
 		assert.Equal(kataGuestNydusRootDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir)
 		assert.Equal(kataGuestNydusImageDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"images"+"/")
 		assert.Equal(kataGuestSharedDir(), os.Getenv("XDG_RUNTIME_DIR")+defaultKataGuestNydusRootDir+"containers"+"/")
 	} else {
 		assert.Equal(kataHostSharedDir(), defaultKataHostSharedDir)
 		assert.Equal(kataGuestSharedDir(), defaultKataGuestSharedDir)
-		assert.Equal(kataGuestSandboxDir(), defaultKataGuestSandboxDir)
-		assert.Equal(ephemeralPath(), defaultEphemeralPath)
 		assert.Equal(kataGuestNydusRootDir(), defaultKataGuestNydusRootDir)
 		assert.Equal(kataGuestNydusImageDir(), defaultKataGuestNydusRootDir+"rafs"+"/")
 		assert.Equal(kataGuestSharedDir(), defaultKataGuestNydusRootDir+"containers"+"/")
@@ -1300,6 +1298,7 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 		hotPlugVFIO   config.PCIePort
 		coldPlugVFIO  config.PCIePort
 		vfioMode      config.VFIOModeType
+		containerType ContainerType
 		expectVFIODev bool
 	}{
 		{
@@ -1323,6 +1322,25 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 			vfioMode:      config.VFIOModeGuestKernel,
 			expectVFIODev: true,
 		},
+		{
+			// The pause container never owns VFIO devices: cold-plugged
+			// devices are sandbox-level and consumed only by workload
+			// containers.
+			name:          "VFIO device with cold plug enabled skipped for CRI sandbox container",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeGuestKernel,
+			containerType: PodSandbox,
+			expectVFIODev: false,
+		},
+		{
+			name:          "VFIO device with cold plug enabled kept for CRI workload container",
+			hotPlugVFIO:   config.NoPort,
+			coldPlugVFIO:  config.BridgePort,
+			vfioMode:      config.VFIOModeGuestKernel,
+			containerType: PodContainer,
+			expectVFIODev: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1343,6 +1361,10 @@ func TestKataAgentCreateContainerVFIODevices(t *testing.T) {
 			// Setup container config with the VFIO device
 			contConfig := &ContainerConfig{
 				DeviceInfos: []config.DeviceInfo{vfioDevice},
+				Annotations: map[string]string{},
+			}
+			if tt.containerType != "" {
+				contConfig.Annotations[vcAnnotations.ContainerTypeKey] = string(tt.containerType)
 			}
 
 			// Create mock URL for kata agent

@@ -12,13 +12,24 @@ mod utils;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use flate2::read::GzDecoder;
 use log::{error, info};
-use semver::Version;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{BufRead, Write};
 
 /// Env var name used to thread the detected container runtime through the
 /// post-install re-exec. Avoids re-querying the apiserver after we've already
 /// committed to a runtime.
 const DETECTED_RUNTIME_ENV: &str = "KATA_DEPLOY_DETECTED_RUNTIME";
+
+/// Where the kubelet collects a container's last words, putting them in the
+/// pod's status rather than in a log the Job's TTL deletes minutes later.
+///
+/// A mount of its own, so it stays writable under `readOnlyRootFilesystem`.
+const TERMINATION_LOG: &str = "/dev/termination-log";
+
+/// What the kubelet keeps of that file; the rest is dropped.
+const TERMINATION_MESSAGE_MAX: usize = 4096;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -57,37 +68,36 @@ enum Action {
     Install,
     Cleanup,
     Reset,
-    /// Stage 0 of a staged (JobSet) install: validate host/node prerequisites
+    /// Load the SELinux policy module the confined stages need. Runs first in
+    /// both the install and the cleanup pipeline, privileged, since a stage
+    /// asking for a type the node does not define cannot start at all.
+    #[clap(name = "install-stage-selinux-policy")]
+    InstallStageSelinuxPolicy,
+    /// Stage 0 of a staged (JobSet) install: load the host kernel modules the
+    /// enabled runtimes and snapshotters need. The only privileged stage, and
+    /// the only one the DaemonSet path does not share.
+    #[clap(name = "install-stage-load-kernel-modules")]
+    InstallStageLoadKernelModules,
+    /// Stage 1 of a staged (JobSet) install: validate host/node prerequisites
     /// without mutating the host. Fails fast with actionable diagnostics when
     /// the node cannot support installation.
     #[clap(name = "install-stage-host-check")]
     InstallStageHostCheck,
-    /// Stage 1 of a staged (JobSet) install: install kata artifacts/config on
+    /// Stage 2 of a staged (JobSet) install: install kata artifacts/config on
     /// the host and set up configured snapshotters. Does not touch CRI
-    /// configuration, but is still privileged (host writes + snapshotter setup
-    /// shell into the host via nsenter).
+    /// configuration.
     #[clap(name = "install-stage-artifacts")]
     InstallStageArtifacts,
-    /// Stage 2 of a staged (JobSet) install: write CRI drop-ins, restart the
-    /// runtime, and wait for node readiness. Privileged + short-lived.
+    /// Stage 3 of a staged (JobSet) install: write CRI drop-ins, restart the
+    /// runtime, and wait for node readiness.
     #[clap(name = "install-stage-cri")]
     InstallStageCri,
-    /// Stage 3 of a staged (JobSet) install: apply the kata-runtime node label.
-    /// Unprivileged, Kubernetes API only.
-    #[clap(name = "install-stage-label")]
-    InstallStageLabel,
-    /// Cleanup stage 1 of a staged (JobSet) uninstall: remove the kata-runtime
-    /// node label first so the scheduler stops placing kata workloads here.
-    /// Unprivileged, Kubernetes API only.
-    #[clap(name = "cleanup-stage-unlabel")]
-    CleanupStageUnlabel,
     /// Cleanup stage 2 of a staged (JobSet) uninstall: remove CRI drop-ins,
-    /// restart the runtime, and wait for readiness. Privileged + short-lived.
+    /// restart the runtime, and wait for readiness.
     #[clap(name = "cleanup-stage-revert-cri")]
     CleanupStageRevertCri,
     /// Cleanup stage 3 of a staged (JobSet) uninstall: remove kata
-    /// artifacts/config/symlinks from the host. Privileged (mutates the host
-    /// filesystem under the install dir).
+    /// artifacts/config/symlinks from the host.
     #[clap(name = "cleanup-stage-remove-artifacts")]
     CleanupStageRemoveArtifacts,
     /// Internal: entered via re-exec after install completes. Holds the
@@ -100,8 +110,23 @@ enum Action {
 /// Node label applied to mark a node as kata-capable. Shared across the
 /// install/cleanup label stages so the key stays consistent.
 const KATA_RUNTIME_LABEL: &str = "katacontainers.io/kata-runtime";
+/// The value [`KATA_RUNTIME_LABEL`] carries while an install is under way: this
+/// node has to be cleaned up, but cannot run kata workloads yet.
+const KATA_RUNTIME_PENDING: &str = "false";
+/// Every install marks its own nodes with a label named after its
+/// `MULTI_INSTALL_SUFFIX`. Without it, an uninstall removing the shared
+/// [`KATA_RUNTIME_LABEL`] could not tell whether it leaves another install's
+/// workloads with nowhere to run.
+const INSTANCE_LABEL_PREFIX: &str = "kata-deploy.katacontainers.io/";
+/// The instance name of an install that set no `MULTI_INSTALL_SUFFIX`.
+const DEFAULT_INSTANCE: &str = "default";
 const SUGGESTED_KUBELET_RUNTIME_REQUEST_TIMEOUT_SECS: u64 = 10 * 60;
+const MKFS_EROFS: &str = "mkfs.erofs";
 const MIN_EROFS_UTILS_VERSION: &str = "1.8.2";
+/// The `mkfs.erofs` options kata-deploy configures containerd's EROFS differ to
+/// use, both added in erofs-utils 1.8.2. Spelled as the binary's own usage text
+/// does, which is where `validate_mkfs_erofs_options` looks for them.
+const REQUIRED_MKFS_EROFS_OPTIONS: &[&str] = &["--mkfs-time", "--sort"];
 
 // Cap the tokio runtime to a small fixed number of worker threads. The default
 // multi-thread runtime allocates `num_cpus()` workers (each with a ~2 MiB
@@ -109,8 +134,8 @@ const MIN_EROFS_UTILS_VERSION: &str = "1.8.2";
 // DaemonSet pod's VmData reservation (~440 MiB). Two workers is plenty:
 //
 //   - the install path is overwhelmingly I/O-bound,
-//   - it shells out to `nsenter ... systemctl restart …` (synchronous,
-//     blocking calls that wedge the thread they run on for tens of seconds);
+//   - host command and systemd D-Bus operations are synchronous and may block
+//     for tens of seconds;
 //     a second worker keeps the health server able to answer kubelet probes
 //     within timeoutSeconds while the first is blocked.
 //
@@ -119,6 +144,47 @@ const MIN_EROFS_UTILS_VERSION: &str = "1.8.2";
 // probe and the pod is restarted before install can finish.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    let result = run().await;
+    if let Err(error) = result.as_ref() {
+        write_termination_message(error);
+    }
+    result
+}
+
+/// The error chain on one line, as `kubectl` will show it.
+fn termination_message(error: &anyhow::Error) -> String {
+    // A failing host command brings its stderr along, newlines and all.
+    let mut message = format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.len() > TERMINATION_MESSAGE_MAX {
+        // The outermost context says which step failed, so the tail goes.
+        const ELLIPSIS: &str = "... (truncated)";
+        let keep = TERMINATION_MESSAGE_MAX - ELLIPSIS.len();
+        let keep = (0..=keep)
+            .rev()
+            .find(|index| message.is_char_boundary(*index))
+            .unwrap_or(0);
+        message.truncate(keep);
+        message.push_str(ELLIPSIS);
+    }
+    message
+}
+
+/// Best-effort: outside a pod there is no such file, and the reason is logged
+/// either way.
+fn write_termination_message(error: &anyhow::Error) {
+    if !std::path::Path::new(TERMINATION_LOG).exists() {
+        return;
+    }
+
+    if let Err(write_error) = std::fs::write(TERMINATION_LOG, termination_message(error)) {
+        log::warn!("failed to write {TERMINATION_LOG}: {write_error}");
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Set log level based on DEBUG environment variable
@@ -143,20 +209,43 @@ async fn main() -> Result<()> {
     }
 
     let config = config::Config::from_env()?;
+    if matches!(
+        args.action,
+        Action::InstallStageSelinuxPolicy
+            | Action::InstallStageLoadKernelModules
+            | Action::InstallStageHostCheck
+            | Action::InstallStageArtifacts
+            | Action::InstallStageCri
+            | Action::CleanupStageRevertCri
+            | Action::CleanupStageRemoveArtifacts
+    ) {
+        verify_node_machine_id()?;
+    }
     let action_str = match args.action {
         Action::Install => "install",
         Action::Cleanup => "cleanup",
         Action::Reset => "reset",
+        Action::InstallStageSelinuxPolicy => "install-stage-selinux-policy",
+        Action::InstallStageLoadKernelModules => "install-stage-load-kernel-modules",
         Action::InstallStageHostCheck => "install-stage-host-check",
         Action::InstallStageArtifacts => "install-stage-artifacts",
         Action::InstallStageCri => "install-stage-cri",
-        Action::InstallStageLabel => "install-stage-label",
-        Action::CleanupStageUnlabel => "cleanup-stage-unlabel",
         Action::CleanupStageRevertCri => "cleanup-stage-revert-cri",
         Action::CleanupStageRemoveArtifacts => "cleanup-stage-remove-artifacts",
         Action::InternalPostInstallWait => "internal-post-install-wait",
     };
-    config.print_info(action_str);
+    // Every stage of a staged run resolves the same pod env, so repeating the
+    // configuration in each one buries the few lines that differ. Only the stage
+    // that opens a run prints it; keep this in sync with the chart's stage order.
+    let opens_a_run = matches!(
+        args.action,
+        Action::Install
+            | Action::Cleanup
+            | Action::Reset
+            | Action::InstallStageLoadKernelModules
+            | Action::CleanupStageRevertCri
+    );
+    config.print_info(action_str, opens_a_run);
 
     // After re-exec we already know which runtime we committed to during
     // install — trust the env var and skip the apiserver round-trip. For
@@ -164,6 +253,9 @@ async fn main() -> Result<()> {
     let runtime = match args.action {
         Action::InternalPostInstallWait => std::env::var(DETECTED_RUNTIME_ENV)
             .with_context(|| format!("missing {DETECTED_RUNTIME_ENV} env var after re-exec"))?,
+        // Loading a policy module is the same work whatever the CRI is, and this
+        // runs before every stage that would need one detected.
+        Action::InstallStageSelinuxPolicy => String::new(),
         _ => {
             let r = runtime::get_container_runtime(&config).await?;
             info!("Detected container runtime: {r}");
@@ -296,32 +388,30 @@ async fn main() -> Result<()> {
         // pipeline as a short-lived Job/initContainer and exits. The DaemonSet
         // path does not use these directly; it goes through `install` above,
         // which composes the same stage functions.
+        Action::InstallStageSelinuxPolicy => {
+            install_stage_selinux_policy(&config)?;
+            info!("Install SELinux-policy stage completed, exiting");
+        }
+        Action::InstallStageLoadKernelModules => {
+            install_stage_load_kernel_modules(&config)?;
+            info!("Install kernel-module stage completed, exiting");
+        }
         Action::InstallStageHostCheck => {
-            install_stage_host_check(&config, &runtime).await?;
+            install_stage_host_check(&config, &runtime, true).await?;
             info!("Install host-check stage completed, exiting");
         }
         Action::InstallStageArtifacts => {
-            install_stage_artifacts(&config, &runtime).await?;
+            install_stage_artifacts(&config, &runtime, true).await?;
             info!("Install artifacts stage completed, exiting");
         }
         Action::InstallStageCri => {
-            install_stage_cri(&config, &runtime).await?;
+            install_stage_cri(&config, &runtime, true).await?;
             info!("Install CRI stage completed, exiting");
         }
-        Action::InstallStageLabel => {
-            install_stage_label(&config).await?;
-            info!("Install label stage completed, exiting");
-        }
-        // Staged (JobSet) cleanup actions. These run in reverse order
-        // (unlabel -> revert-cri -> remove-artifacts) and, unlike the DaemonSet
-        // `cleanup` above, do not perform DaemonSet-presence gating: the JobSet
-        // workflow only schedules these when an uninstall is actually intended.
-        Action::CleanupStageUnlabel => {
-            cleanup_stage_unlabel(&config).await?;
-            info!("Cleanup unlabel stage completed, exiting");
-        }
+        // No DaemonSet check here, unlike `cleanup` above: these stages only run
+        // when an uninstall is what the dispatcher was asked for.
         Action::CleanupStageRevertCri => {
-            cleanup_stage_revert_cri(&config, &runtime).await?;
+            cleanup_stage_revert_cri(&config, &runtime, true).await?;
             info!("Cleanup revert-cri stage completed, exiting");
         }
         Action::CleanupStageRemoveArtifacts => {
@@ -331,6 +421,54 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Confirm this pod is on the node the dispatcher meant.
+///
+/// A Job is bound to a node by name, and a name can outlive the machine that
+/// carried it, so refuse to mutate a host whose machine ID is not the one the
+/// dispatcher passed down. An older chart passes none, and then there is nothing to
+/// compare against.
+fn verify_node_machine_id() -> Result<()> {
+    const EXPECTED_ENV: &str = "NODE_MACHINE_ID";
+    const HOST_MACHINE_ID: &str = "/host-machine-id";
+
+    let Ok(expected) = std::env::var(EXPECTED_ENV) else {
+        return Ok(());
+    };
+    let actual = std::fs::read_to_string(HOST_MACHINE_ID)
+        .with_context(|| format!("failed to read the host identity from {HOST_MACHINE_ID}"))?;
+    anyhow::ensure!(
+        actual.trim() == expected.trim(),
+        "target node identity changed before host mutation: expected machine ID {}, found {}",
+        expected.trim(),
+        actual.trim()
+    );
+    Ok(())
+}
+
+/// Serialize host mutation across every kata-deploy running on this node.
+///
+/// Two releases working on the same node at once would interleave their
+/// configuration edits and restarts, leaving the runtime reading configuration that
+/// is only half written. The lock lives on the host because that is all two
+/// releases share, and is held until the returned file is dropped.
+fn acquire_node_mutation_lock() -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+
+    const LOCK_PATH: &str = "/host-run-lock/kata-deploy.lock";
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(LOCK_PATH)
+        .with_context(|| format!("failed to open the node mutation lock {LOCK_PATH}"))?;
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to acquire the node mutation lock {LOCK_PATH}"));
+    }
+    Ok(lock)
 }
 
 /// Re-exec the current binary into the hidden `internal-post-install-wait`
@@ -362,9 +500,9 @@ fn reexec_into_post_install_wait(
 async fn install(config: &config::Config, runtime: &str) -> Result<()> {
     info!("Installing Kata Containers");
 
-    install_stage_host_check(config, runtime).await?;
-    install_stage_artifacts(config, runtime).await?;
-    install_stage_cri(config, runtime).await?;
+    install_stage_host_check(config, runtime, false).await?;
+    install_stage_artifacts(config, runtime, false).await?;
+    install_stage_cri(config, runtime, false).await?;
     install_stage_label(config).await?;
 
     info!("Kata Containers installation completed successfully");
@@ -383,11 +521,858 @@ const SUPPORTED_RUNTIMES: &[&str] = &[
     "microk8s",
 ];
 
-/// Install stage 0 (host-check): validate that this node can support a Kata
-/// installation before any host mutation happens. This is read-only and safe
-/// to run repeatedly; it fails fast with actionable diagnostics so a staged
-/// JobSet can abort the per-node pipeline before the privileged stages run.
-async fn install_stage_host_check(config: &config::Config, runtime: &str) -> Result<()> {
+const HOST_ROOT: &str = "/host";
+const HOST_MODULES_LOAD_DIR: &str = "/host-modules-load.d";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostModule {
+    name: &'static str,
+    required: bool,
+}
+
+impl HostModule {
+    const fn required(name: &'static str) -> Self {
+        Self {
+            name,
+            required: true,
+        }
+    }
+
+    const fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+        }
+    }
+}
+
+/// The modules the stage can load itself, kept apart from the x86 backend
+/// requirement because no module can satisfy the latter on its own.
+#[derive(Debug, Default)]
+struct HostModulePlan {
+    modules: Vec<HostModule>,
+    needs_x86_virtualization: bool,
+}
+
+/// Not composed into [`install`], so the DaemonSet path stays unprivileged.
+fn install_stage_load_kernel_modules(config: &config::Config) -> Result<()> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .context("failed to read /proc/cpuinfo while selecting host kernel modules")?;
+    let custom_bases = config
+        .custom_runtimes
+        .iter()
+        .map(|runtime| runtime.base_config.as_str())
+        .collect::<Vec<_>>();
+    let erofs_enabled = config
+        .experimental_setup_snapshotter
+        .as_ref()
+        .is_some_and(|snapshotters| snapshotters.iter().any(|s| s == "erofs"));
+    let plan = host_modules_for_install(
+        std::env::consts::ARCH,
+        &cpuinfo,
+        &config
+            .shims_for_arch
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &custom_bases,
+        erofs_enabled,
+        config.erofs_dmverity,
+    )?;
+
+    if plan.modules.is_empty() && !plan.needs_x86_virtualization {
+        info!("install (kernel-modules): no host modules are needed");
+        return Ok(());
+    }
+
+    let _node_lock = acquire_node_mutation_lock()?;
+    // Lazily, so modules that are already loaded need no modprobe.
+    let mut modprobe = None;
+    let mut loaded = Vec::new();
+    for module in &plan.modules {
+        if host_module_visible(module.name) {
+            info!(
+                "install (kernel-modules): host module {} is already loaded",
+                module.name
+            );
+            loaded.push(module.name);
+            continue;
+        }
+
+        info!(
+            "install (kernel-modules): loading host module {}",
+            module.name
+        );
+        let path = match &modprobe {
+            Some(path) => path,
+            None => match find_host_modprobe() {
+                Ok(path) => modprobe.insert(path),
+                Err(error) => {
+                    handle_module_load_failure(*module, error)?;
+                    continue;
+                }
+            },
+        };
+        match run_host_modprobe(path, module.name) {
+            Ok(()) => loaded.push(module.name),
+            Err(error) => handle_module_load_failure(*module, error)?,
+        }
+    }
+
+    if plan.needs_x86_virtualization {
+        ensure_x86_virtualization_backend()?;
+    }
+
+    // Persisting what loaded, rather than what was asked for, keeps a module
+    // that does not apply to this node from being retried at every boot.
+    persist_modules_load_config(config, &loaded)?;
+    Ok(())
+}
+
+/// Follows the per-architecture `kata-runtime check` maps.
+fn host_modules_for_install(
+    arch: &str,
+    cpuinfo: &str,
+    shims: &[&str],
+    custom_bases: &[&str],
+    erofs_enabled: bool,
+    erofs_dmverity: bool,
+) -> Result<HostModulePlan> {
+    let has_local_runtime = shims.iter().any(|shim| *shim != "remote")
+        || custom_bases.iter().any(|base| *base != "remote");
+    let mut plan = HostModulePlan::default();
+    let modules = &mut plan.modules;
+
+    if has_local_runtime {
+        let vhost_vsock = if wants_host_vsock_device(shims, custom_bases) {
+            HostModule::required("vhost_vsock")
+        } else {
+            HostModule::optional("vhost_vsock")
+        };
+
+        match arch {
+            "x86_64" => {
+                // Every x86 VMM we ship runs on either KVM or MSHV, picking at
+                // run time, so KVM is worth trying but never the requirement:
+                // a Hyper-V root partition cannot load it and does not need to.
+                plan.needs_x86_virtualization = true;
+                modules.push(HostModule::optional("kvm"));
+                if cpuinfo.contains("GenuineIntel") {
+                    modules.push(HostModule::optional("kvm_intel"));
+                } else if cpuinfo.contains("AuthenticAMD") {
+                    modules.push(HostModule::optional("kvm_amd"));
+                }
+                modules.extend([
+                    HostModule::required("vhost"),
+                    HostModule::required("vhost_net"),
+                    vhost_vsock,
+                ]);
+            }
+            "aarch64" | "riscv64" => modules.extend([
+                HostModule::required("kvm"),
+                HostModule::required("vhost"),
+                HostModule::required("vhost_net"),
+                vhost_vsock,
+            ]),
+            "powerpc64" | "powerpc64le" => modules.extend([
+                HostModule::required("kvm"),
+                HostModule::required("kvm_hv"),
+                vhost_vsock,
+            ]),
+            "s390x" => modules.extend([HostModule::required("kvm"), vhost_vsock]),
+            unsupported => anyhow::bail!(
+                "cannot select Kata host kernel modules for unsupported architecture {unsupported}"
+            ),
+        }
+    }
+
+    if erofs_enabled {
+        // fs-verity is deliberately absent: CONFIG_FS_VERITY is a bool, so it is
+        // either built in or unavailable, and the host check already says which.
+        modules.extend([HostModule::required("erofs"), HostModule::required("loop")]);
+        if erofs_dmverity {
+            modules.extend([
+                HostModule::required("dm_mod"),
+                HostModule::required("dm_verity"),
+            ]);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    modules.retain(|module| seen.insert(module.name));
+    Ok(plan)
+}
+
+/// QEMU is the only shim that talks to the guest through the host's
+/// /dev/vhost-vsock; the rest tunnel VSOCK over a UNIX socket and do not care
+/// whether the module is there.
+fn wants_host_vsock_device(shims: &[&str], custom_bases: &[&str]) -> bool {
+    shims
+        .iter()
+        .chain(custom_bases.iter())
+        .any(|runtime| runtime.starts_with("qemu"))
+}
+
+/// The device nodes are the honest test. `kvm` alone loads happily on a machine
+/// with virtualization switched off in firmware and creates no /dev/kvm, and
+/// MSHV cannot be loaded at all: mshv_root only binds when the kernel booted as
+/// the Hyper-V root partition.
+fn ensure_x86_virtualization_backend() -> Result<()> {
+    if host_device_exists("kvm") {
+        info!("install (kernel-modules): the host provides KVM");
+        return Ok(());
+    }
+
+    if host_device_exists("mshv") {
+        info!("install (kernel-modules): the host provides MSHV instead of KVM");
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "this node has no usable virtualization backend: neither /dev/kvm nor /dev/mshv is \
+         present. Check the warnings above for why the KVM modules would not load, and that \
+         virtualization is enabled in firmware or exposed to this VM."
+    )
+}
+
+fn host_device_exists(device: &str) -> bool {
+    std::path::Path::new(HOST_ROOT)
+        .join("dev")
+        .join(device)
+        .exists()
+        || std::path::Path::new("/dev").join(device).exists()
+}
+
+fn modules_load_config_path(
+    base: &std::path::Path,
+    multi_install_suffix: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let suffix = multi_install_suffix.unwrap_or("default");
+    anyhow::ensure!(
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "MULTI_INSTALL_SUFFIX {suffix:?} cannot be used in a modules-load.d filename"
+    );
+    Ok(base.join(format!("kata-containers-{suffix}.conf")))
+}
+
+fn persist_modules_load_config(config: &config::Config, modules: &[&str]) -> Result<()> {
+    let path = modules_load_config_path(
+        std::path::Path::new(HOST_MODULES_LOAD_DIR),
+        config.multi_install_suffix.as_deref(),
+    )?;
+    let content = modules_load_config_content(modules);
+    let temp_path = path.with_extension(format!("conf.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut temp = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary modules-load.d file {}",
+                    temp_path.display()
+                )
+            })?;
+        temp.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, &path).with_context(|| {
+            format!(
+                "failed to atomically install modules-load.d file {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
+
+    info!(
+        "install (kernel-modules): persisted the loaded modules in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn modules_load_config_content(modules: &[&str]) -> String {
+    format!(
+        "# Managed by kata-deploy; removed when this installation is uninstalled.\n{}\n",
+        modules.join("\n")
+    )
+}
+
+fn remove_modules_load_config(config: &config::Config) -> Result<()> {
+    let path = modules_load_config_path(
+        std::path::Path::new(HOST_MODULES_LOAD_DIR),
+        config.multi_install_suffix.as_deref(),
+    )?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!(
+            "cleanup (remove-artifacts): removed modules-load.d file {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to remove modules-load.d file {}", path.display())
+            })
+        }
+    }
+    Ok(())
+}
+
+fn handle_module_load_failure(module: HostModule, error: anyhow::Error) -> Result<()> {
+    if module.required {
+        return Err(error);
+    }
+
+    log::warn!(
+        "install (kernel-modules): optional host module {} could not be loaded: {error}",
+        module.name
+    );
+    Ok(())
+}
+
+/// The path is returned as it looks after the chroot, not as mounted here.
+fn find_host_modprobe() -> Result<String> {
+    const CANDIDATES: &[&str] = &[
+        "/usr/sbin/modprobe",
+        "/sbin/modprobe",
+        "/usr/bin/modprobe",
+        "/bin/modprobe",
+    ];
+
+    CANDIDATES
+        .iter()
+        .find(|path| host_path_is_file(std::path::Path::new(HOST_ROOT), std::path::Path::new(path)))
+        .map(|path| (*path).to_string())
+        .with_context(|| {
+            format!(
+                "host modprobe was not found under {HOST_ROOT}; install kmod on the node before \
+                 deploying Kata"
+            )
+        })
+}
+
+/// An absolute symlink target belongs to the host, not to this image.
+fn host_path_is_file(root: &std::path::Path, path: &std::path::Path) -> bool {
+    // The kernel's MAXSYMLINKS: fewer would reject chains the chroot resolves.
+    const MAX_HOPS: usize = 40;
+
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let mounted = root.join(current.strip_prefix("/").unwrap_or(&current));
+        let Ok(metadata) = std::fs::symlink_metadata(&mounted) else {
+            return false;
+        };
+        if !metadata.is_symlink() {
+            return metadata.is_file();
+        }
+        let Ok(target) = std::fs::read_link(&mounted) else {
+            return false;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            // ".." is left for the kernel to resolve against the real dir.
+            current
+                .parent()
+                .unwrap_or(std::path::Path::new("/"))
+                .join(target)
+        };
+    }
+    false
+}
+
+fn run_host_modprobe(modprobe: &str, module: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let host_root = std::ffi::CString::new(HOST_ROOT).expect("HOST_ROOT contains no NUL");
+    let root_dir = std::ffi::CString::new("/").expect("root path contains no NUL");
+    let mut command = std::process::Command::new(modprobe);
+    command.arg(module);
+
+    // This image ships no kmod, and only the host's own modprobe matches the
+    // running kernel's modules and compression.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::chroot(host_root.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(root_dir.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute host {modprobe} for module {module}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "host modprobe failed for module {module} (status {}): stdout={stdout:?}, stderr={stderr:?}",
+        output.status
+    )
+}
+
+/// The policy module shipped in this image, and the domains the chart names in
+/// each stage's `seLinuxOptions`.
+const SELINUX_POLICY_PATH: &str = "/opt/kata-artifacts/selinux/kata-deploy.cil";
+const SELINUX_POLICY_MODULE: &str = "kata-deploy";
+const SELINUX_POLICY_DOMAINS: &[&str] = &[
+    "kata_deploy_check_t",
+    "kata_deploy_artifacts_t",
+    "kata_deploy_cri_t",
+    "kata_deploy_node_binaries_t",
+    "kata_deploy_t",
+];
+
+/// `; policy-revision: N` in the shipped CIL, added to this to give the priority
+/// the module is installed at.
+///
+/// The node keeps the highest-priority module of a name, so this is what stops
+/// an older image -- installing or uninstalling a release of its own on a node
+/// a newer one already set up -- from replacing the newer rules with its own.
+/// 400 is semodule's own default for administrator-installed modules.
+const SELINUX_POLICY_PRIORITY_BASE: u32 = 400;
+const SELINUX_POLICY_REVISION_TAG: &str = "; policy-revision:";
+
+/// Load the SELinux policy module the confined stages need.
+///
+/// Installed with the *host's* own `semodule`, for the same reason the kernel
+/// modules use the host's `modprobe`: the policy store belongs to the node and
+/// only the node's tooling matches its version.
+fn install_stage_selinux_policy(config: &config::Config) -> Result<()> {
+    let Some(selinuxfs) = host_selinuxfs() else {
+        // Not an error, so the chart's flag can be left on for a mixed cluster:
+        // runc ignores labels where SELinux is off.
+        info!("install (selinux-policy): SELinux is disabled on this node, nothing to load");
+        return Ok(());
+    };
+    info!(
+        "install (selinux-policy): SELinux is enabled (selinuxfs at {})",
+        selinuxfs.display()
+    );
+
+    // A node whose policy already carries the domains needs nothing from us, so
+    // one managing its own SELinux policy is not obliged to carry semodule too.
+    let semodule = match find_host_semodule() {
+        Some(semodule) => semodule,
+        None => return require_preloaded_selinux_policy(&selinuxfs),
+    };
+
+    // The node has one policy store, so two releases installing at once would
+    // drive it concurrently.
+    let _node_lock = acquire_node_mutation_lock()?;
+
+    let policy = std::fs::read_to_string(SELINUX_POLICY_PATH)
+        .with_context(|| format!("failed to read the SELinux policy {SELINUX_POLICY_PATH}"))?;
+    let priority = SELINUX_POLICY_PRIORITY_BASE + selinux_policy_revision(&policy)?;
+    let installed = installed_selinux_modules(&semodule)?;
+
+    let mut modules: Vec<(String, String)> = Vec::new();
+    match installed.get(SELINUX_POLICY_MODULE) {
+        // Reinstalled rather than skipped when the priorities match: a rebuilt
+        // image may carry new rules under the same revision, and installing is
+        // idempotent.
+        Some(&present) if present > priority => info!(
+            "install (selinux-policy): this node carries {SELINUX_POLICY_MODULE} at priority \
+             {present}, above this image's {priority}; leaving the newer module in place"
+        ),
+        _ => modules.push((format!("{SELINUX_POLICY_MODULE}.cil"), policy)),
+    }
+    modules.extend(selinux_path_modules(config, &installed));
+
+    if !modules.is_empty() {
+        let staged = stage_selinux_modules_on_host(&modules)?;
+        let result = run_host_semodule(&semodule, priority, &staged.chroot_paths);
+        staged.discard();
+        result?;
+    }
+
+    verify_selinux_domains(&selinuxfs)
+}
+
+/// Where the node's selinuxfs is, or `None` when SELinux is disabled.
+///
+/// One kernel-wide filesystem, so the container's own view of it is the node's;
+/// the host mount is tried first in case a runtime stops offering a writable one.
+fn host_selinuxfs() -> Option<std::path::PathBuf> {
+    ["/host/sys/fs/selinux", "/sys/fs/selinux"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.join("enforce").exists())
+}
+
+/// The path is returned as it looks after the chroot, not as mounted here.
+fn find_host_semodule() -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "/usr/sbin/semodule",
+        "/sbin/semodule",
+        "/usr/bin/semodule",
+        "/bin/semodule",
+    ];
+
+    CANDIDATES
+        .iter()
+        .find(|path| host_path_is_file(std::path::Path::new(HOST_ROOT), std::path::Path::new(path)))
+        .map(|path| (*path).to_string())
+}
+
+/// Nothing can be loaded here, so the node's policy has to already say what the
+/// stages need. It usually will not, hence the error naming both ways out.
+fn require_preloaded_selinux_policy(selinuxfs: &std::path::Path) -> Result<()> {
+    info!("install (selinux-policy): no semodule on this node, so nothing can be loaded here");
+    verify_selinux_domains(selinuxfs).with_context(|| {
+        format!(
+            "this node has SELinux enabled but no semodule under {HOST_ROOT}: install \
+             policycoreutils on the node, or load an equivalent of {SELINUX_POLICY_PATH} into \
+             its policy by other means"
+        )
+    })
+}
+
+/// The `; policy-revision: N` the shipped CIL carries.
+fn selinux_policy_revision(policy: &str) -> Result<u32> {
+    policy
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(SELINUX_POLICY_REVISION_TAG))
+        .with_context(|| {
+            format!("{SELINUX_POLICY_PATH} carries no `{SELINUX_POLICY_REVISION_TAG} N` line")
+        })?
+        .trim()
+        .parse()
+        .with_context(|| format!("{SELINUX_POLICY_PATH} has an unparsable policy revision"))
+}
+
+/// Every module in the node's store, by name, at the highest priority it is
+/// installed at.
+fn installed_selinux_modules(semodule: &str) -> Result<std::collections::HashMap<String, u32>> {
+    let output = host_semodule_command(semodule)
+        .arg("--list-modules=full")
+        .output()
+        .with_context(|| format!("failed to execute host {semodule} to list the policy store"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "host semodule could not list the node's policy store (status {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    // `<priority> <name> <lang>` per line.
+    let mut modules = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(Ok(priority)), Some(name)) = (fields.next().map(str::parse), fields.next())
+        else {
+            continue;
+        };
+        modules
+            .entry(name.to_string())
+            .and_modify(|highest| *highest = std::cmp::max(*highest, priority))
+            .or_insert(priority);
+    }
+    Ok(modules)
+}
+
+/// A directory the installer writes whose label the shipped module cannot know,
+/// because the chart can move the directory anywhere on the node.
+///
+/// The rules are written against an attribute, so covering a node's own label
+/// means adding its type to that attribute and nothing else. One module per
+/// type rather than one per release: two releases with different prefixes must
+/// not take each other's coverage away.
+struct SelinuxWriteTarget {
+    /// Distinguishes the modules, so the two targets never collide on a name.
+    kind: &'static str,
+    path: String,
+    attribute: &'static str,
+    /// What the shipped module's own `typeattributeset` already covers.
+    granted: &'static [&'static str],
+}
+
+fn selinux_write_targets(dest_dir: &str) -> Vec<SelinuxWriteTarget> {
+    vec![
+        SelinuxWriteTarget {
+            kind: "install",
+            path: dest_dir.to_string(),
+            attribute: "kata_deploy_install_target",
+            granted: &["usr_t"],
+        },
+        SelinuxWriteTarget {
+            kind: "cri-config",
+            // The chart mounts the host's CRI config dir here, wherever
+            // containerd.configDir put it.
+            path: "/etc/containerd".to_string(),
+            attribute: "kata_deploy_cri_config_target",
+            granted: &["container_var_lib_t", "container_config_t"],
+        },
+    ]
+}
+
+/// The supplementary modules this node needs on top of the shipped one, as
+/// `(file name, contents)`, skipping what the shipped one or the store covers.
+fn selinux_path_modules(
+    config: &config::Config,
+    installed: &std::collections::HashMap<String, u32>,
+) -> Vec<(String, String)> {
+    let mut modules = Vec::new();
+    for target in selinux_write_targets(&config.dest_dir) {
+        let path = std::path::Path::new(&target.path);
+        let Some(file_type) = selinux_file_type(path) else {
+            log::warn!(
+                "install (selinux-policy): cannot read the SELinux label of {}; if it is not \
+                 labelled {}, the confined stages will be denied writing it",
+                target.path,
+                target.granted.join(" or ")
+            );
+            continue;
+        };
+        if target.granted.contains(&file_type.as_str()) {
+            continue;
+        }
+
+        // Names the type, so the same one is shared rather than reinstalled per
+        // release, and an admin reading the store can see what it is for.
+        let module = format!("{SELINUX_POLICY_MODULE}-{}-{file_type}", target.kind);
+        if installed.contains_key(&module) {
+            continue;
+        }
+        info!(
+            "install (selinux-policy): {} is {file_type}, which the shipped policy does not cover; \
+             adding it to {} as {module}",
+            target.path, target.attribute
+        );
+        modules.push((
+            format!("{module}.cil"),
+            format!(
+                "; Generated by kata-deploy: {} is {file_type} on this node, which the\n\
+                 ; kata-deploy module does not cover.\n\
+                 (typeattributeset {} ({file_type}))\n",
+                target.path, target.attribute
+            ),
+        ));
+    }
+    modules
+}
+
+/// The type field of a path's SELinux label, read from the inode's xattr: a bind
+/// mount shares the inode with the host directory it came from, so this is the
+/// label the host has.
+fn selinux_file_type(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let read = |buf: *mut libc::c_void, len: usize| unsafe {
+        libc::lgetxattr(path.as_ptr(), c"security.selinux".as_ptr(), buf, len)
+    };
+
+    // Sized by a first pass: a fixed buffer comes back ERANGE on a long label,
+    // which here is indistinguishable from no label at all.
+    let size = read(std::ptr::null_mut(), 0);
+    if size <= 0 {
+        return None;
+    }
+    let mut label = vec![0u8; size as usize];
+    let size = read(label.as_mut_ptr() as *mut libc::c_void, label.len());
+    if size <= 0 {
+        return None;
+    }
+    label.truncate(size as usize);
+
+    // user:role:type:level, of which only the type is a target here.
+    String::from_utf8_lossy(&label)
+        .trim_end_matches('\0')
+        .split(':')
+        .nth(2)
+        .filter(|file_type| !file_type.is_empty())
+        .map(str::to_string)
+}
+
+/// Modules staged where the chroot can reach them, as the chroot will see them.
+struct StagedModules {
+    staged_paths: Vec<std::path::PathBuf>,
+    chroot_paths: Vec<String>,
+}
+
+impl StagedModules {
+    fn discard(self) {
+        for path in self.staged_paths {
+            if let Err(error) = std::fs::remove_file(&path) {
+                log::debug!(
+                    "install (selinux-policy): could not remove staged policy {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Write the modules somewhere the chroot can reach, since the host's `semodule`
+/// cannot see this image's filesystem.
+fn stage_selinux_modules_on_host(modules: &[(String, String)]) -> Result<StagedModules> {
+    const CHROOT_DIR: &str = "/run/kata-deploy";
+
+    let dir = std::path::Path::new(HOST_ROOT).join(CHROOT_DIR.trim_start_matches('/'));
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create the policy staging directory {}",
+            dir.display()
+        )
+    })?;
+
+    let mut staged = StagedModules {
+        staged_paths: Vec::new(),
+        chroot_paths: Vec::new(),
+    };
+    for (name, contents) in modules {
+        let staged_path = dir.join(name);
+        std::fs::write(&staged_path, contents).with_context(|| {
+            format!(
+                "failed to stage the SELinux policy {}",
+                staged_path.display()
+            )
+        })?;
+        staged.staged_paths.push(staged_path);
+        staged.chroot_paths.push(format!("{CHROOT_DIR}/{name}"));
+    }
+    Ok(staged)
+}
+
+/// A `semodule` that will run against the node's own policy store.
+fn host_semodule_command(semodule: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+
+    let host_root = std::ffi::CString::new(HOST_ROOT).expect("HOST_ROOT contains no NUL");
+    let root_dir = std::ffi::CString::new("/").expect("root path contains no NUL");
+    let mut command = std::process::Command::new(semodule);
+
+    unsafe {
+        command.pre_exec(move || {
+            if libc::chroot(host_root.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(root_dir.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+fn run_host_semodule(semodule: &str, priority: u32, policies: &[String]) -> Result<()> {
+    // One transaction for all of them: each is a full policy rebuild otherwise.
+    let mut command = host_semodule_command(semodule);
+    command.arg(format!("--priority={priority}"));
+    for policy in policies {
+        command.arg("--install").arg(policy);
+    }
+
+    info!(
+        "install (selinux-policy): loading {} at priority {priority} with the host's {semodule}",
+        policies.join(", ")
+    );
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute host {semodule}"))?;
+    if output.status.success() {
+        info!("install (selinux-policy): policy modules loaded");
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "host semodule failed to install {} (status {}): stdout={stdout:?}, stderr={stderr:?}",
+        policies.join(", "),
+        output.status
+    )
+}
+
+/// Confirm every domain the chart asks for now resolves, so that a stage which
+/// would otherwise fail with an opaque runc error fails here by name instead.
+///
+/// Asked of the kernel through selinuxfs, which needs no `seinfo`: nodes are not
+/// obliged to carry setools, and RHEL 9 does not install it.
+fn verify_selinux_domains(selinuxfs: &std::path::Path) -> Result<()> {
+    let context_path = selinuxfs.join("context");
+    // An unwritable interface would read as "every domain missing", so check it
+    // before trusting its rejections.
+    if let Err(error) = std::fs::OpenOptions::new().write(true).open(&context_path) {
+        log::warn!(
+            "install (selinux-policy): cannot use {} to verify the policy's domains ({error}); \
+             a stage requesting a missing domain will fail with an opaque runc error instead of \
+             a clear one here",
+            context_path.display()
+        );
+        return Ok(());
+    }
+
+    let missing: Vec<&str> = SELINUX_POLICY_DOMAINS
+        .iter()
+        .copied()
+        .filter(|domain| !selinux_context_is_valid(&context_path, domain))
+        .collect();
+
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the node's SELinux policy does not define {}; the install stages ask for those domains, \
+         so they would fail to start. Check what the store carries, and at which priority, with \
+         `semodule --list-modules=full`",
+        missing.join(", ")
+    );
+
+    info!(
+        "install (selinux-policy): all {} domains resolve",
+        SELINUX_POLICY_DOMAINS.len()
+    );
+    Ok(())
+}
+
+fn selinux_context_is_valid(context_path: &std::path::Path, domain: &str) -> bool {
+    use std::io::Write;
+
+    // One open per call: selinuxfs allows a single write per open and fails the
+    // next with EBUSY, so a shared handle would fail every domain but the first.
+    let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(context_path) else {
+        return false;
+    };
+    // A whole context, as the kernel validates no single field of one. The role
+    // and level are those the chart pairs each domain with.
+    file.write_all(format!("system_u:system_r:{domain}:s0").as_bytes())
+        .is_ok()
+}
+
+/// Install stage 1 (host-check): validate that this node can support a Kata
+/// installation before artifacts or CRI configuration are changed. This is
+/// read-only and safe to run repeatedly; it fails fast with actionable
+/// diagnostics so a staged Job can abort before persistent host changes.
+///
+/// `staged` marks the job-mode pipeline, whose containers hold no Kubernetes
+/// credentials: the one check that needs the apiserver (reading the kubelet's
+/// `runtimeRequestTimeout` out of `/configz`, which is advisory) is left to the
+/// dispatcher, which runs it per node before dispatching.
+async fn install_stage_host_check(
+    config: &config::Config,
+    runtime: &str,
+    staged: bool,
+) -> Result<()> {
     info!("install (host-check): validating node prerequisites for runtime {runtime}");
 
     if !SUPPORTED_RUNTIMES.contains(&runtime) {
@@ -395,6 +1380,8 @@ async fn install_stage_host_check(config: &config::Config, runtime: &str) -> Res
             "Runtime {runtime} is not supported for Kata Containers installation"
         ));
     }
+
+    runtime::validate_declared_distribution(config, runtime)?;
 
     if runtime != "crio" {
         runtime::containerd::containerd_snapshotter_version_check(config).await?;
@@ -432,7 +1419,7 @@ async fn install_stage_host_check(config: &config::Config, runtime: &str) -> Res
                 for s in &non_empty_snapshotters {
                     match s.as_str() {
                         "erofs" => {
-                            validate_erofs_prerequisites(config).await?;
+                            validate_erofs_prerequisites(config, staged).await?;
                         }
                         "nydus" => {}
                         _ => {
@@ -446,7 +1433,7 @@ async fn install_stage_host_check(config: &config::Config, runtime: &str) -> Res
         }
     }
 
-    if config_uses_guest_pull(config) {
+    if config_uses_guest_pull(config) && !staged {
         validate_kubelet_runtime_request_timeout(config, "guest pull").await?;
     }
 
@@ -454,7 +1441,7 @@ async fn install_stage_host_check(config: &config::Config, runtime: &str) -> Res
     Ok(())
 }
 
-async fn validate_erofs_prerequisites(config: &config::Config) -> Result<()> {
+async fn validate_erofs_prerequisites(config: &config::Config, staged: bool) -> Result<()> {
     info!("Validating EROFS snapshotter prerequisites");
 
     runtime::containerd::containerd_erofs_snapshotter_version_check(config).await?;
@@ -478,7 +1465,7 @@ async fn validate_erofs_prerequisites(config: &config::Config) -> Result<()> {
         )?;
     }
 
-    validate_mkfs_erofs_version()?;
+    validate_mkfs_erofs_options()?;
 
     // kata-deploy currently configures the EROFS snapshotter with
     // enable_fsverity=true, but this host check does not know the final
@@ -486,7 +1473,9 @@ async fn validate_erofs_prerequisites(config: &config::Config) -> Result<()> {
     // the backing filesystem's fs-verity feature. Keep this check warning-only.
     warn_if_erofs_fsverity_may_be_unavailable();
 
-    validate_kubelet_runtime_request_timeout(config, "EROFS layer conversion").await?;
+    if !staged {
+        validate_kubelet_runtime_request_timeout(config, "EROFS layer conversion").await?;
+    }
 
     Ok(())
 }
@@ -546,84 +1535,112 @@ fn validate_host_kernel_feature_available(
 }
 
 fn host_module_visible(module_name: &str) -> bool {
-    let sys_module_path = format!("/sys/module/{module_name}");
-    if utils::host_exec(&["test", "-d", &sys_module_path]).is_ok() {
+    if std::path::Path::new(&format!("/sys/module/{module_name}")).is_dir() {
         return true;
     }
 
-    let proc_modules_pattern = format!("^{module_name} ");
-    utils::host_exec(&["grep", "-q", &proc_modules_pattern, "/proc/modules"]).is_ok()
+    std::fs::read_to_string("/proc/modules")
+        .map(|content| {
+            content.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|name| name == module_name)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn host_proc_config_has_builtin_feature(config_symbol: &str) -> bool {
-    let config_value = format!("{config_symbol}=y");
-
-    if utils::host_exec(&["test", "-r", "/proc/config.gz"]).is_err() {
-        return false;
-    }
-
-    let Ok(output) = utils::host_exec(&["gzip", "-dc", "/proc/config.gz"]) else {
+    let Ok(config_gz) = std::fs::File::open("/proc/config.gz") else {
         return false;
     };
 
-    output.lines().any(|line| line == config_value)
+    let config_value = format!("{config_symbol}=y");
+    std::io::BufReader::new(GzDecoder::new(config_gz))
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| line == config_value)
 }
 
 fn host_boot_config_has_builtin_feature(config_symbol: &str) -> bool {
-    let config_pattern = format!("^{config_symbol}=y");
-
-    let output = utils::host_exec(&["uname", "-r"]);
-    let Ok(kernel_release) = output else {
+    let config_value = format!("{config_symbol}=y");
+    let Ok(kernel_release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
         return false;
     };
 
     let kernel_config_path = format!("/boot/config-{}", kernel_release.trim());
-    utils::host_exec(&["grep", "-Eq", &config_pattern, &kernel_config_path]).is_ok()
+    std::fs::read_to_string(kernel_config_path)
+        .map(|content| content.lines().any(|line| line == config_value))
+        .unwrap_or(false)
 }
 
-fn validate_mkfs_erofs_version() -> Result<()> {
-    let output = utils::host_exec(&["mkfs.erofs", "--version"]).with_context(|| {
-        "Required host command `mkfs.erofs` is not available. Install \
-         erofs-utils >= 1.8.2 before enabling the EROFS snapshotter."
+/// Verify that the host's `mkfs.erofs` accepts the options containerd's EROFS
+/// differ will pass to it (see `configure_erofs_snapshotter`).
+///
+/// Running the host binary to ask it is not possible: it is linked against the
+/// host's loader and libraries, which the container does not have. So this
+/// searches the binary for the options its usage text lists. What it documents
+/// is what it accepts, which is what we care about — the erofs-utils version
+/// only ever stood in for it.
+fn validate_mkfs_erofs_options() -> Result<()> {
+    let mkfs_erofs = utils::find_host_program(MKFS_EROFS).with_context(|| {
+        format!(
+            "Required host command `{MKFS_EROFS}` is not available. Install \
+             erofs-utils >= {MIN_EROFS_UTILS_VERSION} before enabling the \
+             EROFS snapshotter, or add a nodeBinaries entry taking it from \
+             an image."
+        )
     })?;
 
-    let version = parse_erofs_utils_version(&output).with_context(|| {
-        format!("Could not parse erofs-utils version from `mkfs.erofs --version`: {output}")
-    })?;
-    let minimum_version = Version::parse(MIN_EROFS_UTILS_VERSION)?;
+    let binary = std::fs::read(&mkfs_erofs)
+        .with_context(|| format!("Failed to read host command {}", mkfs_erofs.display()))?;
 
-    if version < minimum_version {
+    let missing: Vec<&str> = REQUIRED_MKFS_EROFS_OPTIONS
+        .iter()
+        .copied()
+        .filter(|option| !documents_option(&binary, option))
+        .collect();
+
+    if !missing.is_empty() {
         anyhow::bail!(
-            "Host erofs-utils version {} is too old. kata-deploy configures \
-             EROFS fsmerge mkfs_options that require erofs-utils >= {}.",
-            version,
+            "Host {} does not support the {} option(s) that kata-deploy \
+             configures the EROFS differ to use. Install erofs-utils >= {}.",
+            mkfs_erofs.display(),
+            missing.join(", "),
             MIN_EROFS_UTILS_VERSION
         );
     }
 
     info!(
-        "host erofs-utils version {} satisfies minimum {}",
-        version, MIN_EROFS_UTILS_VERSION
+        "host {} supports the required mkfs options",
+        mkfs_erofs.display()
     );
 
     Ok(())
 }
 
-fn parse_erofs_utils_version(output: &str) -> Result<Version> {
-    let version_re = regex::Regex::new(r"([0-9]+)\.([0-9]+)(?:\.([0-9]+))?")?;
-    let captures = version_re
-        .captures(output)
-        .ok_or_else(|| anyhow::anyhow!("erofs-utils version not found"))?;
+/// Whether `binary` documents `option`, dashes and all, as a word of its own.
+///
+/// Looking for the bare `getopt_long` name instead does not work: it is short
+/// enough for the linker to fold into the tail of an unrelated string, which
+/// nothing can tell from `sort` inside `qsort`. aarch64 builds of erofs-utils
+/// keep no `sort` but the one in glibc's `rfc3484_sort`.
+fn documents_option(binary: &[u8], option: &str) -> bool {
+    let option = option.as_bytes();
+    let bounds_word = |byte: &u8| !byte.is_ascii_alphanumeric() && !b"-_".contains(byte);
 
-    let major = captures[1].parse::<u64>()?;
-    let minor = captures[2].parse::<u64>()?;
-    let patch = captures
-        .get(3)
-        .map(|patch| patch.as_str().parse::<u64>())
-        .transpose()?
-        .unwrap_or(0);
-
-    Version::parse(&format!("{major}.{minor}.{patch}")).map_err(Into::into)
+    binary
+        .windows(option.len())
+        .enumerate()
+        .any(|(start, window)| {
+            window == option
+                // Both ends, so that `--sort` inside a longer word is no more
+                // accepted than `sort` inside `qsort` was.
+                && start
+                    .checked_sub(1)
+                    .is_none_or(|before| bounds_word(&binary[before]))
+                && binary.get(start + option.len()).is_none_or(bounds_word)
+        })
 }
 
 fn warn_if_erofs_fsverity_may_be_unavailable() {
@@ -732,19 +1749,183 @@ fn mapping_contains_value(mapping: Option<&str>, expected_value: &str) -> bool {
     })
 }
 
+/// The marker label of one install.
+fn instance_label(suffix: Option<&str>) -> String {
+    format!(
+        "{INSTANCE_LABEL_PREFIX}{}",
+        suffix.unwrap_or(DEFAULT_INSTANCE)
+    )
+}
+
+/// What the marks of the other installs on a node say about the label they share.
+#[derive(Debug, PartialEq, Eq)]
+enum SharedLabel {
+    /// At least one other install is serving Kata here: the shared label stays `true`.
+    Keep,
+    /// The other installs here are all mid-flight or failed. Nothing may be scheduled
+    /// on the strength of the shared label, but the key has to stay so those installs'
+    /// own uninstalls can still find the node.
+    Demote,
+    /// Ours was the last mark: the key goes.
+    Remove,
+}
+
+/// Read the marks other installs left on a node.
+///
+/// The value matters, not just the key: a `false` mark is a claim on a node whose
+/// install has not finished, and reading it as "Kata is served here" would leave the
+/// node advertised with nothing behind it.
+fn shared_label_after(labels: &BTreeMap<String, String>, ours: &str) -> SharedLabel {
+    let mut any = false;
+    for (key, value) in labels {
+        if key == ours || !key.starts_with(INSTANCE_LABEL_PREFIX) {
+            continue;
+        }
+        any = true;
+        if value != KATA_RUNTIME_PENDING {
+            return SharedLabel::Keep;
+        }
+    }
+
+    if any {
+        SharedLabel::Demote
+    } else {
+        SharedLabel::Remove
+    }
+}
+
+/// Take this install's mark off the node, and the label it shares with every other
+/// install with it, unless another install is still holding the node. Returns
+/// whether one is.
+async fn release_node(config: &config::Config) -> Result<bool> {
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+
+    // A legacy install leaves no marker behind, so when no other marker is left,
+    // ask whether another kata-deploy still wants a pod here: otherwise this
+    // uninstall takes the shared label out from under that install.
+    //
+    // Answered here rather than inside the rewrite below, and so a snapshot: a
+    // DaemonSet lives outside this node, and nothing can make reading it atomic
+    // with a write guarded by this node's resourceVersion. Should that DaemonSet
+    // go in between, the shared label is left for the next uninstall to take.
+    let labels = k8s::get_node_labels(config).await?;
+    let legacy_others = shared_label_after(&labels, &ours) == SharedLabel::Remove
+        && k8s::other_kata_deploy_daemonset_selects_node(config).await?;
+
+    let others = k8s::rewrite_node_labels(config, |labels| {
+        let mut updates: Vec<(String, Option<String>)> = Vec::new();
+        if labels.contains_key(&ours) {
+            updates.push((ours.clone(), None));
+        }
+
+        let verdict = if legacy_others {
+            SharedLabel::Keep
+        } else {
+            shared_label_after(labels, &ours)
+        };
+
+        match verdict {
+            SharedLabel::Keep => (),
+            SharedLabel::Demote => {
+                if labels.get(KATA_RUNTIME_LABEL).map(String::as_str) != Some(KATA_RUNTIME_PENDING)
+                {
+                    updates.push((
+                        KATA_RUNTIME_LABEL.to_string(),
+                        Some(KATA_RUNTIME_PENDING.to_string()),
+                    ));
+                }
+            }
+            SharedLabel::Remove => {
+                if labels.contains_key(KATA_RUNTIME_LABEL) {
+                    updates.push((KATA_RUNTIME_LABEL.to_string(), None));
+                }
+            }
+        }
+
+        (updates, verdict)
+    })
+    .await?;
+
+    match others {
+        SharedLabel::Keep => info!(
+            "another kata-deploy install is still serving Kata from this node, leaving {} in place",
+            KATA_RUNTIME_LABEL
+        ),
+        SharedLabel::Demote => info!(
+            "one or more kata-deploy installs have claimed this node but none has finished \
+             installing on it, so {} stays as {}",
+            KATA_RUNTIME_LABEL, KATA_RUNTIME_PENDING
+        ),
+        SharedLabel::Remove => info!("removed {} from this node", KATA_RUNTIME_LABEL),
+    }
+
+    Ok(others != SharedLabel::Remove)
+}
+
+/// Mark the node as one kata-deploy has started installing on, before anything is
+/// written to it.
+///
+/// `helm uninstall` cleans every node carrying the kata-runtime label, whatever its
+/// value, so a node labelled only once the install *finishes* is out of its reach
+/// for as long as it is half-installed. Not `true`, because RuntimeClasses select
+/// that exact value; an existing label is left alone, so reinstalling over a working
+/// node cannot withdraw it from scheduling.
+///
+/// Best-effort: failing an install over one label write would trade a rare orphan
+/// for a common outage. Staged runs skip this, because their dispatcher marks the
+/// node before creating the Job.
+async fn claim_node(config: &config::Config) {
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+    for key in [KATA_RUNTIME_LABEL, ours.as_str()] {
+        if let Err(e) = k8s::label_node(config, key, Some(KATA_RUNTIME_PENDING), false).await {
+            log::warn!(
+                "install: could not mark node {} as being installed on ({e}). Should this install \
+                 fail before it labels the node, `helm uninstall` will not clean this node up.",
+                config.node_name
+            );
+        }
+    }
+}
+
 /// Install stage 1 (artifacts): place kata artifacts/config on the host and set
-/// up any configured snapshotters. This does not touch CRI configuration, but it
-/// still needs privileged host access: writing under the host install dir and
-/// the snapshotter setup (e.g. nydus) shell into the host via nsenter.
-async fn install_stage_artifacts(config: &config::Config, runtime: &str) -> Result<()> {
+/// up any configured snapshotters. This does not touch CRI configuration.
+async fn install_stage_artifacts(
+    config: &config::Config,
+    runtime: &str,
+    staged: bool,
+) -> Result<()> {
     info!("install (artifacts): installing kata artifacts on host");
+
+    if !staged {
+        claim_node(config).await;
+    }
+
+    let _node_lock = acquire_node_mutation_lock()?;
+
+    // Refuse before touching the host: whole-file containerd configuration keeps a
+    // single backup, which the first uninstall would restore over every other
+    // installation's handlers. Read under the lock, or another release's edit could
+    // be half-written while this one decides.
+    if runtime != "crio"
+        && config
+            .multi_install_suffix
+            .as_deref()
+            .is_some_and(|suffix| !suffix.is_empty())
+    {
+        let paths = config.get_containerd_paths(runtime).await?;
+        anyhow::ensure!(
+            paths.use_drop_in,
+            "multi-install requires containerd drop-in support: whole-file configuration and its \
+             single backup cannot preserve another installation during uninstall"
+        );
+    }
 
     artifacts::install_artifacts(config, runtime).await?;
 
     if runtime != "crio" {
         if let Some(snapshotters) = config.experimental_setup_snapshotter.as_ref() {
             for snapshotter in snapshotters {
-                artifacts::snapshotters::install_snapshotter(snapshotter, config).await?;
+                artifacts::snapshotters::install_snapshotter(snapshotter, config, runtime).await?;
             }
         }
     }
@@ -754,10 +1935,59 @@ async fn install_stage_artifacts(config: &config::Config, runtime: &str) -> Resu
 }
 
 /// Install stage 2 (cri): write CRI drop-ins, configure snapshotters, restart
-/// the runtime, and wait for the node to become ready. This is the privileged,
-/// node-disrupting stage and is kept short-lived.
-async fn install_stage_cri(config: &config::Config, runtime: &str) -> Result<()> {
+/// the runtime, and wait for the node to become ready. This node-disrupting
+/// stage is kept short-lived.
+///
+/// `staged` distinguishes the two deployment models, because they survive the
+/// runtime restart very differently:
+///
+///   - DaemonSet (`staged == false`): this runs inside a long-lived, regular
+///     container. When containerd is restarted the kubelet re-attaches to the
+///     still-running container, so the process survives the bounce, reaches the
+///     readiness wait, and goes on to label the node in a single shot. It
+///     therefore always restarts.
+///
+///   - Job (`staged == true`): this runs as a short-lived *init* container in a
+///     `restartPolicy: Never` per-node Job. On some platforms (notably AKS)
+///     restarting the very containerd that manages this pod tears the init
+///     container down (exit 255, no logs) before it can finish - so the Job
+///     retries with a fresh pod. To let the retry converge we skip the restart
+///     once three things hold: the config we just (idempotently) re-applied is
+///     byte-for-byte what was already on disk, systemd says the runtime has been
+///     up since it was written, and the node reports the runtime serving the
+///     handlers that config defines. No one of them is enough: an unchanged
+///     config also describes an attempt that died before restarting anything, a
+///     recent restart says nothing about an upgrade that changes the config, and
+///     a node that cannot report handlers cannot rule either way. A genuine
+///     change still restarts; if that restart kills the init container again,
+///     the next retry finds all three satisfied and takes the skip path.
+///
+/// Either way the stage ends by confirming the runtime is serving kata handlers,
+/// so a runtime that ignored what we wrote fails here rather than at the first
+/// kata pod scheduled onto the node.
+async fn install_stage_cri(config: &config::Config, runtime: &str, staged: bool) -> Result<()> {
     info!("install (cri): configuring CRI runtime");
+    let _node_lock = acquire_node_mutation_lock()?;
+
+    if runtime != "crio"
+        && config
+            .multi_install_suffix
+            .as_deref()
+            .is_some_and(|suffix| !suffix.is_empty())
+    {
+        let paths = config.get_containerd_paths(runtime).await?;
+        anyhow::ensure!(
+            paths.use_drop_in,
+            "multi-install requires containerd drop-in support: whole-file configuration and its \
+             single backup cannot preserve another installation during uninstall"
+        );
+    }
+
+    let config_before = if staged {
+        runtime::cri_config_snapshot(config, runtime).await
+    } else {
+        None
+    };
 
     runtime::containerd::setup_containerd_config_files(runtime, config).await?;
 
@@ -772,37 +2002,132 @@ async fn install_stage_cri(config: &config::Config, runtime: &str) -> Result<()>
         }
     }
 
+    let handlers = config.shim_handlers();
+
+    if staged {
+        // Every path out of here that keeps the restart says why: a retry loop that
+        // restarts forever is otherwise indistinguishable from one that never tried.
+        match config_before {
+            None => info!(
+                "install (cri): no readable CRI config predates this attempt; a restart is needed"
+            ),
+            Some(before) => {
+                let unchanged = runtime::cri_config_snapshot(config, runtime)
+                    .await
+                    .is_some_and(|after| after.same_config_as(&before));
+                if !unchanged {
+                    info!(
+                        "install (cri): configuring {runtime} changed its CRI config; a restart is \
+                         needed"
+                    );
+                } else if runtime::lifecycle::cri_serving_config_from(runtime, before.written_at())
+                    .await
+                {
+                    info!(
+                        "install (cri): CRI config for {runtime} is unchanged from a previous \
+                         attempt, and {runtime} has been up since it was written. Skipping the \
+                         (self-terminating) restart and checking the runtime is up instead."
+                    );
+                    runtime::lifecycle::wait_till_cri_unit_active(runtime, 300).await?;
+                    info!("install (cri): runtime is up; CRI stage complete without restart");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     info!("About to restart runtime: {}", runtime);
-    runtime::lifecycle::restart_runtime(config, runtime).await?;
+    runtime::lifecycle::restart_runtime(config, runtime, staged).await?;
     info!("Runtime restart completed successfully");
 
-    Ok(())
+    if staged {
+        // Only the node can say whether the runtime is serving what was written,
+        // and asking needs the apiserver. The dispatcher asks before it labels.
+        if !handlers.is_empty() {
+            info!(
+                "install (cri): leaving the check that {runtime} is serving {handlers:?} to the \
+                 dispatcher, which can ask the node"
+            );
+        }
+        return Ok(());
+    }
+
+    confirm_handlers_are_served(config, runtime, &handlers).await
 }
 
-/// Install stage 3 (label): apply the kata-runtime node label. Unprivileged,
-/// Kubernetes API only. Skips re-applying when the label is already correct.
+/// Generous: the kubelet republishes this on every node status sync.
+const HANDLER_WAIT_SECS: u64 = 120;
+
+/// Fail the cri stage if the runtime came back without a single kata handler.
 ///
-/// As the very last action, once the label is confirmed present, remove any
-/// configured startup taints (`STARTUP_TAINTS`). This is what makes the
-/// scheduling handshake safe: a node can be provisioned with a startup taint
-/// that keeps kata workloads off it until the runtime exists, and that taint is
-/// only lifted here, strictly after artifacts are installed, the CRI runtime is
-/// configured and restarted, and the node is labeled kata-capable.
+/// Restarting a unit says the unit restarted, not that it liked what we wrote.
+/// A runtime that ignored our drop-in would otherwise reach the label stage and
+/// leave a node advertised as kata-capable that cannot run a single kata pod.
+///
+/// A partial list is only reported: a node serving some of our handlers is
+/// running a CRI that read our configuration, which is what this stage is
+/// answerable for.
+async fn confirm_handlers_are_served(
+    config: &config::Config,
+    runtime: &str,
+    handlers: &[String],
+) -> Result<()> {
+    use runtime::lifecycle::HandlerReport;
+
+    match runtime::lifecycle::kata_handlers_loaded(config, handlers, HANDLER_WAIT_SECS).await {
+        HandlerReport::AllLoaded => {
+            info!("install (cri): {runtime} is serving {handlers:?}");
+            Ok(())
+        }
+        HandlerReport::Missing(missing) if missing.len() == handlers.len() => {
+            anyhow::bail!(
+                "{runtime} restarted but node {} reports none of {handlers:?} among its runtime \
+                 handlers, so it is not serving the kata configuration this stage wrote. Check \
+                 {runtime}'s logs for a rejected or unread configuration file.",
+                config.node_name
+            )
+        }
+        HandlerReport::Missing(missing) => {
+            log::warn!(
+                "install (cri): {runtime} is serving kata handlers, but not {missing:?}. The \
+                 RuntimeClasses naming them will not be usable on node {}.",
+                config.node_name
+            );
+            Ok(())
+        }
+        HandlerReport::Unknown => Ok(()),
+    }
+}
+
+/// The last step of the DaemonSet install. Job mode has no such stage: there the
+/// dispatcher labels the node, which is what lets the per-node Jobs run without a
+/// token.
+///
+/// Startup taints are lifted here and nowhere else. A node can be provisioned with
+/// one to keep Kata workloads away until the runtime exists, so it may only be
+/// lifted after the artifacts are installed, the runtime is configured and
+/// restarted, and the node is labelled.
 async fn install_stage_label(config: &config::Config) -> Result<()> {
     info!("install (label): applying node label");
 
-    match k8s::get_node_label(config, KATA_RUNTIME_LABEL).await {
-        Ok(Some(ref val)) if val == "true" => {
-            info!(
-                "install (label): node already labeled {}=true, skipping",
-                KATA_RUNTIME_LABEL
-            );
+    // The shared label admits Kata workloads; our own mark is what this install's
+    // RuntimeClasses select on top of it, and what tells another install's uninstall
+    // that the shared label is not its to remove. A kubelet that clobbers either
+    // leaves the node unusable, so both have to be seen to hold.
+    let ours = instance_label(config.multi_install_suffix.as_deref());
+    let wanted = [(KATA_RUNTIME_LABEL, "true"), (ours.as_str(), "true")];
+
+    match k8s::get_node_labels(config).await {
+        Ok(labels)
+            if wanted
+                .iter()
+                .all(|(key, value)| labels.get(*key).map(String::as_str) == Some(*value)) =>
+        {
+            info!("install (label): node is already labelled, skipping");
         }
-        // Any other state (absent, different value, or a transient read error)
+        // Any other state (absent, a different value, or a transient read error)
         // falls through to label_node_with_retry, which applies and verifies.
-        _ => {
-            label_node_with_retry(config, KATA_RUNTIME_LABEL, "true").await?;
-        }
+        _ => label_node_with_retry(config, &wanted).await?,
     }
 
     remove_startup_taints(config).await;
@@ -863,27 +2188,30 @@ async fn remove_startup_taints(config: &config::Config) {
 /// confirm the label is set, declare install done, and only then would the kubelet
 /// come back up and clobber the label with its cached set.
 ///
-/// To outlive that race we require the label to remain at `label_value` for
+/// To outlive that race we require every label to remain at its value for
 /// `STABILITY_CHECKS` consecutive observations spaced `CHECK_INTERVAL` apart
 /// (≈ 15 s by default — comfortably more than the kubelet's status-update period).
-/// If it ever drifts inside that window we re-apply and restart the stability
+/// If any of them drifts inside that window we re-apply and restart the stability
 /// counter. The whole thing is bounded by `MAX_APPLY_ATTEMPTS`.
-async fn label_node_with_retry(
-    config: &config::Config,
-    label_key: &str,
-    label_value: &str,
-) -> Result<()> {
+async fn label_node_with_retry(config: &config::Config, labels: &[(&str, &str)]) -> Result<()> {
     const MAX_APPLY_ATTEMPTS: u32 = 12;
     const STABILITY_CHECKS: u32 = 6;
     const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
+    let described = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     for attempt in 1..=MAX_APPLY_ATTEMPTS {
-        k8s::label_node(config, label_key, Some(label_value), true).await?;
+        for (key, value) in labels {
+            k8s::label_node(config, key, Some(value), true).await?;
+        }
         info!(
-            "Applied label {}={} (attempt {}/{}); verifying stability ({} checks @ {}s)",
-            label_key,
-            label_value,
+            "Applied label(s) {} (attempt {}/{}); verifying stability ({} checks @ {}s)",
+            described,
             attempt,
             MAX_APPLY_ATTEMPTS,
             STABILITY_CHECKS,
@@ -895,21 +2223,29 @@ async fn label_node_with_retry(
         while stable_count < STABILITY_CHECKS {
             tokio::time::sleep(CHECK_INTERVAL).await;
 
-            match k8s::get_node_label(config, label_key).await {
-                Ok(Some(val)) if val == label_value => {
-                    stable_count += 1;
-                    info!(
-                        "Label {}={} stable {}/{}",
-                        label_key, label_value, stable_count, STABILITY_CHECKS
-                    );
-                }
-                Ok(actual) => {
+            match k8s::get_node_labels(config).await {
+                Ok(observed) => {
+                    let drifted = labels
+                        .iter()
+                        .filter(|(key, value)| {
+                            observed.get(*key).map(String::as_str) != Some(value)
+                        })
+                        .map(|(key, _)| format!("{key}={:?}", observed.get(*key)))
+                        .collect::<Vec<_>>();
+
+                    if drifted.is_empty() {
+                        stable_count += 1;
+                        info!(
+                            "Label(s) {} stable {}/{}",
+                            described, stable_count, STABILITY_CHECKS
+                        );
+                        continue;
+                    }
+
                     log::warn!(
-                        "Label {}={} drifted to {:?} after {}/{} stable observation(s); \
-                         re-applying (attempt {}/{})",
-                        label_key,
-                        label_value,
-                        actual,
+                        "Label(s) {} drifted after {}/{} stable observation(s); re-applying \
+                         (attempt {}/{})",
+                        drifted.join(", "),
                         stable_count,
                         STABILITY_CHECKS,
                         attempt,
@@ -920,9 +2256,9 @@ async fn label_node_with_retry(
                 }
                 Err(e) => {
                     log::warn!(
-                        "Failed to verify label {} during stability check \
+                        "Failed to verify label(s) {} during stability check \
                          (attempt {}/{}): {}; will re-apply",
-                        label_key,
+                        described,
                         attempt,
                         MAX_APPLY_ATTEMPTS,
                         e,
@@ -935,8 +2271,8 @@ async fn label_node_with_retry(
 
         if !needs_reapply {
             info!(
-                "Label {}={} confirmed stable on node after {} apply attempt(s)",
-                label_key, label_value, attempt
+                "Label(s) {} confirmed stable on node after {} apply attempt(s)",
+                described, attempt
             );
             return Ok(());
         }
@@ -947,9 +2283,8 @@ async fn label_node_with_retry(
     }
 
     anyhow::bail!(
-        "Label {}={} did not remain stable after {} apply attempts",
-        label_key,
-        label_value,
+        "Label(s) {} did not remain stable after {} apply attempts",
+        described,
         MAX_APPLY_ATTEMPTS
     );
 }
@@ -957,28 +2292,30 @@ async fn label_node_with_retry(
 async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
     info!("Cleaning up Kata Containers");
 
-    // Step 1: Check if THIS pod's owning DaemonSet still exists.
-    // If it does, this is a pod restart (rolling update, label change, etc.),
-    // not an uninstall — skip everything so running kata pods are not disrupted.
     info!(
-        "Checking if DaemonSet '{}' still exists",
+        "Checking whether DaemonSet '{}' still wants a pod on this node",
         config.daemonset_name
     );
-    if k8s::own_daemonset_exists(config).await? {
+    if k8s::own_daemonset_selects_node(config).await? {
         info!(
-            "DaemonSet '{}' still exists, \
-             skipping all cleanup to avoid disrupting running kata pods",
+            "DaemonSet '{}' still selects this node, skipping all cleanup to avoid disrupting a \
+             rolling restart",
             config.daemonset_name
         );
         return Ok(());
     }
 
-    // Step 2: Our DaemonSet is gone (uninstall). Perform instance-specific
-    // cleanup: snapshotters, CRI config, and artifacts for this instance.
     info!(
-        "DaemonSet '{}' not found, proceeding with instance cleanup",
+        "DaemonSet '{}' is gone or no longer selects this node, proceeding with instance cleanup",
         config.daemonset_name
     );
+
+    // Unmark before mutating the host, so nothing lands on files about to go.
+    // Only the shared label waits for the last install; the restart below does
+    // not - this install's configuration is leaving the disk the runtime reads.
+    info!("Removing this install's node labels");
+    release_node(config).await?;
+    let _node_lock = acquire_node_mutation_lock()?;
 
     if runtime != "crio" {
         match config.experimental_setup_snapshotter.as_ref() {
@@ -1005,70 +2342,29 @@ async fn cleanup(config: &config::Config, runtime: &str) -> Result<()> {
     artifacts::remove_artifacts(config).await?;
     info!("Successfully removed kata artifacts");
 
-    // Step 3: Check if ANY other kata-deploy DaemonSets still exist.
-    // Shared resources (node label, CRI restart) are only safe to touch
-    // when no other kata-deploy instance remains.
-    let other_ds_count = k8s::count_any_kata_deploy_daemonsets(config).await?;
-    if other_ds_count > 0 {
-        info!(
-            "{} other kata-deploy DaemonSet(s) still exist, \
-             skipping node label removal and CRI restart",
-            other_ds_count
-        );
-        return Ok(());
-    }
-
-    info!("No other kata-deploy DaemonSets found, performing full shared cleanup");
-
-    info!("Removing kata-runtime label from node");
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
-    info!("Successfully removed kata-runtime label");
-
     // Restart the CRI runtime last. On k3s/rke2 this restarts the entire
     // server process, which kills this (terminating) pod. By doing it after
     // all other cleanup, we ensure config and artifacts are already gone.
     info!("Restarting CRI runtime");
-    runtime::restart_and_wait_for_ready(config, runtime).await?;
+    runtime::restart_and_wait_for_ready(config, runtime, false).await?;
     info!("CRI runtime restarted successfully");
 
     info!("Kata Containers cleanup completed successfully");
     Ok(())
 }
 
-/// Cleanup stage 1 (unlabel): remove the kata-runtime node label first so the
-/// scheduler stops placing kata workloads on this node before any host
-/// mutation. Unprivileged, Kubernetes API only. Skips when already absent.
-async fn cleanup_stage_unlabel(config: &config::Config) -> Result<()> {
-    info!("cleanup (unlabel): removing node label");
-
-    // If the label is already absent, there is nothing to do. Any other state
-    // (present, or unknown due to a transient read error) falls through to the
-    // removal below.
-    if let Ok(None) = k8s::get_node_label(config, KATA_RUNTIME_LABEL).await {
-        info!(
-            "cleanup (unlabel): label {} already absent, skipping",
-            KATA_RUNTIME_LABEL
-        );
-        return Ok(());
-    }
-
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
-    info!("cleanup (unlabel): label removed");
-    Ok(())
-}
-
-/// Cleanup stage 2 (revert-cri): remove CRI drop-ins (and any snapshotter
+/// Cleanup stage 2 (revert-cri): remove CRI configuration (and any snapshotter
 /// config), then restart the runtime and wait for readiness. This is the
-/// privileged, node-disrupting cleanup stage and is kept short-lived. Skips
-/// entirely when the CRI drop-ins are already absent, avoiding an unnecessary
-/// runtime restart.
-async fn cleanup_stage_revert_cri(config: &config::Config, runtime: &str) -> Result<()> {
+/// privileged, node-disrupting cleanup stage and is kept short-lived. Snapshotter
+/// cleanup is independent because a partial install may fail before writing CRI
+/// configuration; only the restart is skipped when configuration is absent.
+async fn cleanup_stage_revert_cri(
+    config: &config::Config,
+    runtime: &str,
+    staged: bool,
+) -> Result<()> {
     info!("cleanup (revert-cri): reverting CRI configuration");
-
-    if !cri_drop_in_present(config, runtime).await {
-        info!("cleanup (revert-cri): CRI drop-ins already absent, skipping");
-        return Ok(());
-    }
+    let _node_lock = acquire_node_mutation_lock()?;
 
     if runtime != "crio" {
         if let Some(snapshotters) = config.experimental_setup_snapshotter.as_ref() {
@@ -1079,23 +2375,43 @@ async fn cleanup_stage_revert_cri(config: &config::Config, runtime: &str) -> Res
         }
     }
 
+    if !cri_configuration_present(config, runtime).await {
+        info!("cleanup (revert-cri): CRI configuration already absent, skipping restart");
+        return Ok(());
+    }
+
     runtime::cleanup_cri_runtime_config(config, runtime).await?;
 
     info!("cleanup (revert-cri): restarting runtime");
-    runtime::restart_and_wait_for_ready(config, runtime).await?;
+    runtime::restart_and_wait_for_ready(config, runtime, staged).await?;
     info!("cleanup (revert-cri): runtime restarted");
 
     Ok(())
 }
 
 /// Cleanup stage 3 (remove-artifacts): delete kata artifacts/config/symlinks
-/// from the host. Skips when the install directory is already gone.
+/// from the host. Skips when the install directory is already gone or empty.
 async fn cleanup_stage_remove_artifacts(config: &config::Config) -> Result<()> {
     info!("cleanup (remove-artifacts): removing kata artifacts from host");
+    let _node_lock = acquire_node_mutation_lock()?;
+    // A partial install may have loaded modules but extracted nothing.
+    remove_modules_load_config(config)?;
 
-    if !std::path::Path::new(&config.host_install_dir).exists() {
+    // The install dir is bind mounted into this pod, so it always exists and
+    // outlives the artifacts it holds: an empty one means there is nothing
+    // left to remove. Anything other than an absent directory is a reason to
+    // stop, since we cannot tell an empty install from one we failed to read.
+    let empty_or_absent = match std::fs::read_dir(&config.host_install_dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read install dir {}", config.host_install_dir))
+        }
+    };
+    if empty_or_absent {
         info!(
-            "cleanup (remove-artifacts): install dir {} already absent, skipping",
+            "cleanup (remove-artifacts): install dir {} already empty, skipping",
             config.host_install_dir
         );
         return Ok(());
@@ -1106,26 +2422,24 @@ async fn cleanup_stage_remove_artifacts(config: &config::Config) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort check for whether kata's CRI drop-in configuration is present on
+/// Best-effort check for whether kata's CRI configuration is present on
 /// the host for this runtime. Used by the staged cleanup to skip a disruptive
 /// runtime restart when there is nothing to revert. On any uncertainty (e.g.
 /// the containerd paths cannot be resolved) this returns `true` so the caller
 /// errs on the side of running the revert rather than incorrectly skipping it.
-async fn cri_drop_in_present(config: &config::Config, runtime: &str) -> bool {
+async fn cri_configuration_present(config: &config::Config, runtime: &str) -> bool {
     if runtime == "crio" {
         return std::path::Path::new(&config.crio_drop_in_conf_file).exists();
     }
 
     match config.get_containerd_paths(runtime).await {
-        Ok(paths) => {
-            // /etc/containerd is mounted directly; other paths live under /host.
-            let resolved = if paths.drop_in_file.starts_with("/etc/containerd/") {
-                std::path::PathBuf::from(&paths.drop_in_file)
-            } else {
-                std::path::Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
-            };
-            resolved.exists()
-        }
+        Ok(paths) if paths.use_drop_in => std::path::Path::new(&paths.drop_in_file).exists(),
+        // Whole-file mode leaves no drop-in to look for, so ask the question the
+        // revert itself asks: is any of this configuration ours to undo?
+        Ok(paths) => !matches!(
+            runtime::containerd::whole_file_disposition(&paths.config_file, &paths.backup_file),
+            runtime::containerd::WholeFileConfig::Keep
+        ),
         Err(e) => {
             log::warn!(
                 "cleanup (revert-cri): could not resolve containerd paths to check drop-in \
@@ -1139,10 +2453,18 @@ async fn cri_drop_in_present(config: &config::Config, runtime: &str) -> bool {
 async fn reset(config: &config::Config, runtime: &str) -> Result<()> {
     info!("Resetting Kata Containers");
 
-    k8s::label_node(config, KATA_RUNTIME_LABEL, None, false).await?;
+    // Nothing has been removed from the host here, so there is nothing the live
+    // runtime must converge to: the shared runtime, and the kubelet with it, are
+    // only bounced when this is the last install left on the node.
+    if release_node(config).await? {
+        info!("Skipping the CRI restart, another install is still using it");
+        return Ok(());
+    }
+
+    let _node_lock = acquire_node_mutation_lock()?;
     runtime::lifecycle::restart_cri_runtime(config, runtime).await?;
     if matches!(runtime, "crio" | "containerd") {
-        utils::host_systemctl(&["restart", "kubelet"])?;
+        utils::host_systemctl(&["restart", "kubelet"]).await?;
     }
     runtime::lifecycle::wait_till_node_is_ready_timeout(config, Some(300)).await?;
 
@@ -1167,11 +2489,14 @@ mod tests {
     #[case("install", Action::Install)]
     #[case("cleanup", Action::Cleanup)]
     #[case("reset", Action::Reset)]
+    #[case("install-stage-selinux-policy", Action::InstallStageSelinuxPolicy)]
+    #[case(
+        "install-stage-load-kernel-modules",
+        Action::InstallStageLoadKernelModules
+    )]
     #[case("install-stage-host-check", Action::InstallStageHostCheck)]
     #[case("install-stage-artifacts", Action::InstallStageArtifacts)]
     #[case("install-stage-cri", Action::InstallStageCri)]
-    #[case("install-stage-label", Action::InstallStageLabel)]
-    #[case("cleanup-stage-unlabel", Action::CleanupStageUnlabel)]
     #[case("cleanup-stage-revert-cri", Action::CleanupStageRevertCri)]
     #[case("cleanup-stage-remove-artifacts", Action::CleanupStageRemoveArtifacts)]
     #[case("internal-post-install-wait", Action::InternalPostInstallWait)]
@@ -1185,11 +2510,13 @@ mod tests {
         );
     }
 
-    /// Unknown actions must be rejected rather than silently accepted.
     #[rstest]
     #[case("install-stage")]
     #[case("cleanup-stage")]
     #[case("install-stage-foo")]
+    // These two were real actions once, so an older chart can still ask for them.
+    #[case("install-stage-label")]
+    #[case("cleanup-stage-unlabel")]
     #[case("bogus")]
     fn test_unknown_action_is_rejected(#[case] arg: &str) {
         assert!(
@@ -1201,6 +2528,88 @@ mod tests {
     /// The hidden internal waiter must stay hidden from `--help` so users never
     /// invoke it directly, while still being parseable (asserted above).
     #[test]
+    fn an_install_is_named_after_its_suffix() {
+        assert_eq!(
+            instance_label(None),
+            "kata-deploy.katacontainers.io/default"
+        );
+        assert_eq!(
+            instance_label(Some("dev")),
+            "kata-deploy.katacontainers.io/dev"
+        );
+    }
+
+    /// The shared label may only be taken away when it is nobody else's.
+    #[test]
+    fn only_another_installs_mark_counts() {
+        let ours = instance_label(Some("dev"));
+        let mark = |keys: &[&str]| -> BTreeMap<String, String> {
+            keys.iter()
+                .map(|key| (key.to_string(), "true".to_string()))
+                .collect()
+        };
+
+        assert_eq!(
+            shared_label_after(&mark(&[&ours]), &ours),
+            SharedLabel::Remove
+        );
+        assert_eq!(
+            shared_label_after(
+                &mark(&[&ours, KATA_RUNTIME_LABEL, "kubernetes.io/hostname"]),
+                &ours
+            ),
+            SharedLabel::Remove,
+            "neither the shared label nor an unrelated one is another install's mark"
+        );
+        assert_eq!(
+            shared_label_after(&mark(&[&ours, &instance_label(None)]), &ours),
+            SharedLabel::Keep
+        );
+        assert_eq!(
+            shared_label_after(&mark(&[&instance_label(Some("prod"))]), &ours),
+            SharedLabel::Keep
+        );
+    }
+
+    /// Installs that have claimed the node but not finished on it must not keep it
+    /// advertised as able to run Kata - and must still be able to find it.
+    #[test]
+    fn unfinished_installs_hold_the_key_without_the_promise() {
+        let ours = instance_label(Some("dev"));
+        let labels = BTreeMap::from([
+            (ours.clone(), "true".to_string()),
+            (instance_label(None), KATA_RUNTIME_PENDING.to_string()),
+        ]);
+
+        assert_eq!(shared_label_after(&labels, &ours), SharedLabel::Demote);
+
+        // However many of them there are.
+        let labels = BTreeMap::from([
+            (instance_label(None), KATA_RUNTIME_PENDING.to_string()),
+            (
+                instance_label(Some("prod")),
+                KATA_RUNTIME_PENDING.to_string(),
+            ),
+        ]);
+
+        assert_eq!(shared_label_after(&labels, &ours), SharedLabel::Demote);
+    }
+
+    /// One install serving Kata is enough to keep the shared label, however many
+    /// unfinished ones are read before it - and labels are read in key order, so
+    /// "default" here is read before "prod".
+    #[test]
+    fn a_serving_install_outweighs_unfinished_ones() {
+        let ours = instance_label(Some("dev"));
+        let labels = BTreeMap::from([
+            (instance_label(None), KATA_RUNTIME_PENDING.to_string()),
+            (instance_label(Some("prod")), "true".to_string()),
+        ]);
+
+        assert_eq!(shared_label_after(&labels, &ours), SharedLabel::Keep);
+    }
+
+    #[test]
     fn test_internal_action_is_hidden() {
         let internal = Action::InternalPostInstallWait
             .to_possible_value()
@@ -1211,30 +2620,33 @@ mod tests {
         );
     }
 
+    /// The usage text spellings are the ones erofs-utils 1.9.3 ships on both
+    /// amd64 and arm64; `rfc3484_sort` is what an arm64 build folds its own
+    /// `sort` into.
     #[rstest]
-    #[case("mkfs.erofs (erofs-utils) 1.9\navailable compressors: lz4\n", "1.9.0")]
-    #[case("mkfs.erofs (erofs-utils) 1.8.2\n", "1.8.2")]
-    #[case("erofs-utils 1.8\n", "1.8.0")]
-    fn test_parse_erofs_utils_version(#[case] output: &str, #[case] expected: &str) {
-        assert_eq!(
-            parse_erofs_utils_version(output).unwrap(),
-            Version::parse(expected).unwrap()
-        );
-    }
-
-    #[test]
-    fn test_parse_erofs_utils_version_rejects_invalid_output() {
-        assert!(parse_erofs_utils_version("mkfs.erofs unknown").is_err());
+    #[case(b"    --mkfs-time         the t", "--mkfs-time", true)]
+    #[case(b"ta\n --sort=<path,none>  ", "--sort", true)]
+    #[case(b"\0rfc3484_sort\0", "--sort", false)]
+    #[case(b"\0qsort\0", "--sort", false)]
+    #[case(b"\0--mkfs-timestamp\0", "--mkfs-time", false)]
+    #[case(b"\0--sort", "--sort", true)]
+    #[case(b"1.7.1\0", "--sort", false)]
+    // A word ending in the option is no more a mention of it than `qsort` is.
+    #[case(b"\0x--sort\0", "--sort", false)]
+    #[case(b"\0no_--mkfs-time\0", "--mkfs-time", false)]
+    // Nothing before it to look at.
+    #[case(b"--sort=<path,none>", "--sort", true)]
+    fn test_documents_option(#[case] binary: &[u8], #[case] option: &str, #[case] expected: bool) {
+        assert_eq!(documents_option(binary, option), expected);
     }
 
     /// All non-internal staged actions remain visible in `--help` so operators
     /// can discover and run individual stages.
     #[rstest]
     #[case(Action::InstallStageHostCheck)]
+    #[case(Action::InstallStageLoadKernelModules)]
     #[case(Action::InstallStageArtifacts)]
     #[case(Action::InstallStageCri)]
-    #[case(Action::InstallStageLabel)]
-    #[case(Action::CleanupStageUnlabel)]
     #[case(Action::CleanupStageRevertCri)]
     #[case(Action::CleanupStageRemoveArtifacts)]
     fn test_staged_actions_are_visible(#[case] action: Action) {
@@ -1246,5 +2658,316 @@ mod tests {
             "staged action {:?} should be visible in --help",
             value.get_name(),
         );
+    }
+
+    /// The pod's status has to read as a sentence, not as a Debug dump.
+    #[test]
+    fn the_termination_message_is_the_whole_chain_on_one_line() {
+        let error = anyhow::anyhow!("host modprobe failed for module vhost_vsock")
+            .context("failed to load the host kernel modules");
+
+        assert_eq!(
+            termination_message(&error),
+            "failed to load the host kernel modules: host modprobe failed for module vhost_vsock"
+        );
+    }
+
+    #[test]
+    fn a_commands_output_does_not_break_the_termination_message_apart() {
+        let error =
+            anyhow::anyhow!("modprobe: FATAL: module vhost_vsock not found\nin /lib/modules")
+                .context("failed to load the host kernel modules");
+
+        assert_eq!(
+            termination_message(&error),
+            "failed to load the host kernel modules: modprobe: FATAL: module vhost_vsock \
+             not found in /lib/modules"
+        );
+    }
+
+    #[test]
+    fn an_over_long_termination_message_is_marked_as_truncated() {
+        // Twelve bytes to nine characters, so the cut falls inside the "ü" -
+        // which `truncate` panics on rather than tolerates.
+        let error = anyhow::anyhow!("{}", "übergröße".repeat(500));
+        let message = termination_message(&error);
+
+        assert!(message.len() <= TERMINATION_MESSAGE_MAX);
+        assert!(message.ends_with("... (truncated)"));
+        assert!(message.starts_with("übergröße"));
+    }
+
+    fn module_names(modules: &[HostModule]) -> Vec<&str> {
+        modules.iter().map(|module| module.name).collect()
+    }
+
+    fn test_module_plan(
+        arch: &str,
+        cpuinfo: &str,
+        shims: &[&str],
+        custom_bases: &[&str],
+        erofs_enabled: bool,
+        erofs_dmverity: bool,
+    ) -> Result<HostModulePlan> {
+        host_modules_for_install(
+            arch,
+            cpuinfo,
+            shims,
+            custom_bases,
+            erofs_enabled,
+            erofs_dmverity,
+        )
+    }
+
+    fn test_host_modules(
+        arch: &str,
+        cpuinfo: &str,
+        shims: &[&str],
+        custom_bases: &[&str],
+        erofs_enabled: bool,
+        erofs_dmverity: bool,
+    ) -> Result<Vec<HostModule>> {
+        test_module_plan(
+            arch,
+            cpuinfo,
+            shims,
+            custom_bases,
+            erofs_enabled,
+            erofs_dmverity,
+        )
+        .map(|plan| plan.modules)
+    }
+
+    #[rstest]
+    #[case("GenuineIntel", "kvm_intel")]
+    #[case("AuthenticAMD", "kvm_amd")]
+    fn x86_module_selection_follows_cpu_vendor(#[case] vendor: &str, #[case] vendor_module: &str) {
+        let modules = test_host_modules("x86_64", vendor, &["qemu"], &[], false, false).unwrap();
+        assert_eq!(
+            module_names(&modules),
+            vec!["kvm", vendor_module, "vhost", "vhost_net", "vhost_vsock"]
+        );
+    }
+
+    #[test]
+    fn x86_asks_for_a_backend_and_treats_the_kvm_modules_as_optional() {
+        let plan =
+            test_module_plan("x86_64", "GenuineIntel", &["qemu"], &[], false, false).unwrap();
+        assert!(plan.needs_x86_virtualization);
+        for name in ["kvm", "kvm_intel"] {
+            let module = plan
+                .modules
+                .iter()
+                .find(|module| module.name == name)
+                .expect("the KVM modules are still attempted");
+            assert!(!module.required);
+        }
+    }
+
+    /// An unnameable vendor may just mean a Hyper-V root partition, where no KVM
+    /// module would have loaded anyway.
+    #[test]
+    fn unknown_x86_vendor_leaves_the_backend_check_to_decide() {
+        let plan =
+            test_module_plan("x86_64", "UnknownVendor", &["qemu"], &[], false, false).unwrap();
+        assert!(plan.needs_x86_virtualization);
+        assert_eq!(
+            module_names(&plan.modules),
+            vec!["kvm", "vhost", "vhost_net", "vhost_vsock"]
+        );
+    }
+
+    #[rstest]
+    #[case(
+        "aarch64",
+        vec!["kvm", "vhost", "vhost_net", "vhost_vsock"]
+    )]
+    #[case("riscv64", vec!["kvm", "vhost", "vhost_net", "vhost_vsock"])]
+    #[case("powerpc64", vec!["kvm", "kvm_hv", "vhost_vsock"])]
+    #[case("s390x", vec!["kvm", "vhost_vsock"])]
+    fn non_x86_module_selection_matches_kata_check(
+        #[case] arch: &str,
+        #[case] expected: Vec<&str>,
+    ) {
+        let modules = test_host_modules(arch, "", &["qemu"], &[], false, false).unwrap();
+        assert_eq!(module_names(&modules), expected);
+    }
+
+    #[test]
+    fn remote_only_install_needs_no_virtualization_at_all() {
+        for plan in [
+            test_module_plan("x86_64", "", &["remote"], &[], false, false).unwrap(),
+            test_module_plan("x86_64", "", &[], &["remote"], false, false).unwrap(),
+        ] {
+            assert!(plan.modules.is_empty());
+            assert!(!plan.needs_x86_virtualization);
+        }
+    }
+
+    #[test]
+    fn local_custom_runtime_requests_virtualization_modules() {
+        let modules = test_host_modules(
+            "x86_64",
+            "GenuineIntel",
+            &["remote"],
+            &["qemu"],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(module_names(&modules).contains(&"kvm_intel"));
+    }
+
+    #[rstest]
+    #[case(&["qemu-runtime-rs"], true)]
+    #[case(&["clh-azure-runtime-rs"], false)]
+    #[case(&["clh", "qemu"], true)]
+    fn vhost_vsock_is_only_required_where_the_host_device_is_used(
+        #[case] shims: &[&str],
+        #[case] expected_required: bool,
+    ) {
+        let modules =
+            test_host_modules("x86_64", "GenuineIntel", shims, &[], false, false).unwrap();
+        let vsock = modules
+            .iter()
+            .find(|module| module.name == "vhost_vsock")
+            .expect("vhost_vsock is always considered");
+        assert_eq!(vsock.required, expected_required);
+    }
+
+    #[test]
+    fn erofs_features_are_selected_and_deduplicated() {
+        let modules = test_host_modules("aarch64", "", &["qemu"], &[], true, true).unwrap();
+        let names = module_names(&modules);
+        assert!(names.ends_with(&["erofs", "loop", "dm_mod", "dm_verity"]));
+        assert_eq!(
+            names.iter().copied().collect::<HashSet<_>>().len(),
+            names.len()
+        );
+        assert!(modules.iter().all(|module| module.required));
+    }
+
+    #[test]
+    fn modules_load_config_is_per_install() {
+        let base = std::path::Path::new("/etc/modules-load.d");
+        assert_eq!(
+            modules_load_config_path(base, None).unwrap(),
+            base.join("kata-containers-default.conf")
+        );
+        assert_eq!(
+            modules_load_config_path(base, Some("dev")).unwrap(),
+            base.join("kata-containers-dev.conf")
+        );
+        assert!(modules_load_config_path(base, Some("../escape")).is_err());
+
+        let content = modules_load_config_content(&["kvm", "vhost_vsock"]);
+        assert!(content.starts_with("# Managed by kata-deploy"));
+        assert!(content.contains("\nkvm\nvhost_vsock\n"));
+    }
+
+    #[test]
+    fn required_module_failures_abort_but_optional_failures_do_not() {
+        assert!(handle_module_load_failure(
+            HostModule::required("vhost_vsock"),
+            anyhow::anyhow!("no vhost_vsock")
+        )
+        .is_err());
+        assert!(handle_module_load_failure(
+            HostModule::optional("fsverity"),
+            anyhow::anyhow!("no fsverity")
+        )
+        .is_ok());
+    }
+
+    /// /bin/sh exists here but not on the fake host, so only a resolution that
+    /// escapes the root answers true for it.
+    #[rstest]
+    #[case::absolute_symlink("/bin/kmod", true)]
+    #[case::relative_symlink("../bin/kmod", true)]
+    #[case::escapes_the_host_root("/bin/sh", false)]
+    #[case::dangling("/bin/nowhere", false)]
+    fn host_symlinks_resolve_inside_the_host_root(#[case] target: &str, #[case] expected: bool) {
+        let host = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(host.path().join("usr/sbin")).expect("usr/sbin");
+        std::fs::create_dir_all(host.path().join("usr/bin")).expect("usr/bin");
+        std::fs::write(host.path().join("usr/bin/kmod"), b"#!/bin/sh\n").expect("kmod");
+        // usrmerge, so /bin/kmod lands on usr/bin/kmod.
+        std::os::unix::fs::symlink("usr/bin", host.path().join("bin")).expect("bin symlink");
+        std::os::unix::fs::symlink(target, host.path().join("usr/sbin/modprobe"))
+            .expect("modprobe symlink");
+
+        assert_eq!(
+            host_path_is_file(host.path(), std::path::Path::new("/usr/sbin/modprobe")),
+            expected,
+            "modprobe -> {target}"
+        );
+    }
+
+    #[test]
+    fn a_missing_host_path_is_not_a_file() {
+        let host = tempfile::tempdir().expect("tempdir");
+        assert!(!host_path_is_file(
+            host.path(),
+            std::path::Path::new("/usr/sbin/modprobe")
+        ));
+    }
+
+    #[test]
+    fn a_symlink_loop_under_the_host_root_terminates() {
+        let host = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(host.path().join("usr/sbin")).expect("usr/sbin");
+        std::os::unix::fs::symlink("/usr/sbin/b", host.path().join("usr/sbin/a")).expect("a");
+        std::os::unix::fs::symlink("/usr/sbin/a", host.path().join("usr/sbin/b")).expect("b");
+
+        assert!(!host_path_is_file(
+            host.path(),
+            std::path::Path::new("/usr/sbin/a")
+        ));
+    }
+
+    /// The revision is what keeps an older image from replacing a newer
+    /// release's module, so an unreadable one has to fail the stage.
+    #[rstest]
+    #[case("; policy-revision: 7\n(type kata_deploy_t)\n", Some(7))]
+    #[case("(type kata_deploy_t)\n; policy-revision:12", Some(12))]
+    #[case("(type kata_deploy_t)\n", None)]
+    #[case("; policy-revision: v3\n", None)]
+    fn the_policy_revision_comes_from_the_policy(#[case] cil: &str, #[case] expected: Option<u32>) {
+        assert_eq!(selinux_policy_revision(cil).ok(), expected);
+    }
+
+    /// A bump the CIL carries and this does not would install the new rules at
+    /// the old priority, which is the downgrade the revision exists to stop.
+    #[test]
+    fn the_shipped_policy_carries_a_revision() {
+        assert!(selinux_policy_revision(shipped_policy()).is_ok());
+    }
+
+    /// The shipped policy is the source of truth for what a supplement would
+    /// duplicate: drift here means either a redundant module per node, or none
+    /// where one is needed.
+    #[test]
+    fn the_shipped_policy_grants_what_the_supplements_assume() {
+        let policy = shipped_policy();
+
+        for target in selinux_write_targets("/opt/kata") {
+            let granted = policy
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix(&format!("(typeattributeset {} (", target.attribute))
+                })
+                .unwrap_or_else(|| panic!("{} is not set by the policy", target.attribute))
+                .trim_end_matches("))")
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(granted, target.granted, "{}", target.attribute);
+        }
+    }
+
+    /// Embedded rather than read at run time, so a build context missing the
+    /// policy fails to compile instead of failing these two tests with ENOENT.
+    fn shipped_policy() -> &'static str {
+        include_str!("../../selinux/kata-deploy.cil")
     }
 }

@@ -170,6 +170,23 @@ disable_nesting_checks = false
 # Default false
 disable_vhost_net = false
 
+#
+# Default entropy source.
+# The path to a host source of entropy (including a real hardware RNG)
+# /dev/urandom and /dev/random are two main options.
+# Be aware that /dev/random is a blocking source of entropy.  If the host
+# runs out of entropy, the VMs boot time will increase leading to get startup
+# timeouts.
+# The source of entropy /dev/urandom is non-blocking and provides a
+# generally acceptable source of entropy. It should work well for pretty much
+# all practical purposes.
+entropy_source =  "@DEFENTROPYSOURCE@"
+
+# List of valid annotations values for entropy_source
+# The default if not set is empty (all annotations rejected.)
+# Your distribution recommends: @DEFVALIDENTROPYSOURCES@
+valid_entropy_sources = @DEFVALIDENTROPYSOURCES@
+
 # Path to OCI hook binaries in the *guest rootfs*.
 # This does not affect host-side hooks which must instead be added to
 # the OCI spec passed to the runtime.
@@ -272,6 +289,18 @@ guest_swap_size_percent = 100
 # Default 60.
 guest_swap_create_threshold_secs = 60
 
+[hypervisor.dragonball.factory]
+# VM templating support. Once enabled, new VMs are restored from the template
+# initialized with `kata-ctl factory init`.
+#
+# Default false
+enable_template = false
+
+# Specifies the path of the template memory and device-state files.
+#
+# Default "/run/vc/vm/template"
+template_path = "/run/vc/vm/template"
+
 [agent.@PROJECT_TYPE@]
 container_pipe_size = @PIPESIZE@
 # If enabled, make the agent display debug-level messages.
@@ -310,11 +339,11 @@ enable_tracing = false
 
 debug_console_enabled = false
 
-# Agent dial timeout in millisecond.
+# Sleep between agent connection retries, in milliseconds.
 # (default: 10)
 dial_timeout_ms = 10
 
-# Agent reconnect timeout in millisecond.
+# Overall time budget for establishing the agent connection, in milliseconds.
 # Retry times = reconnect_timeout_ms / dial_timeout_ms (default: 300)
 # If you find pod cannot connect to the agent when starting, please
 # consider increasing this value to increase the retry times.
@@ -479,6 +508,14 @@ keep_abnormal = false
 #     Uses tc filter rules to redirect traffic from the network interface
 #     provided by plugin to a tap interface connected to the VM.
 #
+#   - l3forwarding
+#     Uses L3 routing and proxy ARP to forward traffic between the network
+#     interface provided by the plugin and a tap interface connected to the
+#     VM.
+#     Useful for Istio Ambient-style service mesh integration with node
+#     proxies. Supports a single network interface per network namespace.
+#     Experimental feature, IPv4 only.
+#
 internetworking_model = "@DEFNETWORKMODEL_DB@"
 
 name = "@RUNTIMENAME@"
@@ -509,8 +546,7 @@ jaeger_password = ""
 
 # If enabled, the runtime will not create a network namespace for shim and hypervisor processes.
 # This option may have some potential impacts to your host. It should only be used when you know what you're doing.
-# `disable_new_netns` conflicts with `internetworking_model=bridged` and `internetworking_model=macvtap`. It works only
-# with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
+# `disable_new_netns` only works with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
 # (default: false)
 disable_new_netns = false

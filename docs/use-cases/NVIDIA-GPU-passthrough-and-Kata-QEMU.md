@@ -389,6 +389,14 @@ $ helm install kata-deploy \
 
 > **Note:**
 >
+> QEMU seccomp sandboxing is enabled by default for the NVIDIA QEMU runtime
+> classes. If you have performance concerns, disable it by commenting out
+> `seccomp_sandbox` in the configuration file used by the relevant
+> runtime class. See [Using seccomp with runtime-rs](../how-to/how-to-use-seccomp-with-runtime-rs.md)
+> for details.
+
+> **Note:**
+>
 > For node lifecycle management, see the
 > [lifecycle-manager](https://github.com/kata-containers/lifecycle-manager)
 > repository which enables Argo Workflows-based lifecycle management for your
@@ -581,8 +589,8 @@ may need to be adjusted accordingly.
 
 #### Run Kata CI tests locally
 
-Upstream Kata CI runs the CUDA vectorAdd, NUMA, composite attestation,
-NIM/RAG, and NIMService tests. For TEE GPU scenarios, KBS is required for the
+Upstream Kata CI runs the CUDA vectorAdd, NUMA, composite attestation, and
+NIM/RAG tests. For TEE GPU scenarios, KBS is required for the
 attestation and NIM tests, but not for CUDA or NUMA. The best place to get
 started running these tests locally is to look into our
 [NVIDIA CI workflow manifest](https://github.com/kata-containers/kata-containers/blob/main/.github/workflows/run-k8s-tests-on-nvidia-gpu.yaml)
@@ -609,8 +617,7 @@ $ K8S_TEST_NV="k8s-nvidia-cuda.bats" ./gha-run.sh run-nv-tests
 
 > **Note:**
 >
-> The NIM and NIMService tests require `NGC_API_KEY` to contain a valid NGC
-> API key.
+> The NIM tests require `NGC_API_KEY` to contain a valid NGC API key.
 
 #### Deploy pods using attestation
 
