@@ -383,6 +383,12 @@ allow_image_name(p_image, i_image) if {
     not contains(p_image, "@")
     endswith(i_image, concat("", ["/", p_image]))
 }
+# Fallback path (floating tag): Untagged input implies ":latest".
+allow_image_name(p_image, i_image) if {
+    not contains(p_image, "@")
+    not regex.match(":[^/]+$", i_image)
+    allow_image_name(p_image, concat("", [i_image, ":latest"]))
+}
 
 # The Kata Agent reads storage.source.
 allow_image_storages(p_oci, i_oci, i_storages) if {
